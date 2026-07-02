@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>EditorVideo</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<!-- painel lateral único: topo → 4/5 da tela -->
+<aside id="side">
+  <div id="browser">
+    <div id="browser-path"></div>
+    <ul id="browser-list"></ul>
+  </div>
+
+  <div id="ops">
+    <div class="section">
+      <h2>Juntar</h2>
+      <p class="hint">Use o + da lista de arquivos para montar a fila.</p>
+      <ul id="join-list"></ul>
+      <button id="btn-join" class="primary" disabled>Juntar</button>
+    </div>
+
+    <div class="section">
+      <h2>Converter</h2>
+      <label>Formato
+        <select id="conv-format">
+          <option value="mp4" selected>MP4</option>
+          <option value="mkv">MKV</option>
+        </select>
+      </label>
+      <label>Qualidade
+        <select id="conv-quality">
+          <option value="alta">Alta</option>
+          <option value="media" selected>Média</option>
+          <option value="baixa">Baixa</option>
+        </select>
+      </label>
+      <label id="gpu-label"><span>GPU (NVENC)</span><input type="checkbox" id="conv-gpu" checked></label>
+      <button id="btn-convert" class="primary" disabled>Converter</button>
+    </div>
+
+    <div class="section">
+      <h2>Áudio</h2>
+      <button id="btn-extract" class="primary" disabled>Extrair áudio</button>
+    </div>
+  </div>
+</aside>
+
+<!-- área central: topo → 4/5 da tela -->
+<section id="center">
+  <header>
+    <h1>EditorVideo</h1>
+    <span id="gpu-badge" class="badge"></span>
+    <div class="spacer"></div>
+    <button id="btn-undo" class="icon" title="Desfazer (Ctrl+Z)" disabled>↩</button>
+    <button id="btn-redo" class="icon" title="Refazer (Ctrl+Y)" disabled>↪</button>
+  </header>
+  <div id="player-wrap">
+    <video id="player" controls></video>
+    <div id="player-empty">Selecione um vídeo à esquerda</div>
+  </div>
+  <div id="file-info"></div>
+</section>
+
+<!-- faixa inferior: 1/5 da tela, largura total, timeline -->
+<footer id="bottom">
+  <div id="cut-controls">
+    <button id="btn-cut" disabled>Corte <kbd>C</kbd></button>
+    <button id="btn-del-seg" class="danger" disabled title="Tecla Delete">Deletar segmento</button>
+    <div id="export-opts" class="hidden">
+      <label>Formato
+        <select id="export-format">
+          <option value="">Manter original</option>
+          <option value="mp4">MP4 (recodifica)</option>
+          <option value="mkv">MKV (recodifica)</option>
+        </select>
+      </label>
+      <button id="btn-export-go" class="primary">Exportar</button>
+      <button id="btn-export-cancel">Cancelar</button>
+    </div>
+    <button id="btn-export" class="primary" disabled>Exportar</button>
+    <span id="mark-info"></span>
+    <span id="duration-info"></span>
+    <div id="jobs-bar"></div>
+  </div>
+  <canvas id="timeline"></canvas>
+</footer>
+
+<script src="/js/app.js"></script>
+</body>
+</html>
