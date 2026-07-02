@@ -3,6 +3,7 @@
 
 Uso: python3 server.py  →  http://localhost:8765
 """
+import bisect
 import json
 import os
 import re
@@ -84,6 +85,121 @@ def probe(path):
     return info
 
 
+KEYFRAME_EPS = 0.05  # mesma tolerância usada no frontend (CUT_EPS)
+
+# codec de origem -> args de recodificação de borda (mesmo codec, para permitir
+# concatenar por stream copy com o restante do arquivo original)
+EDGE_VIDEO_ENCODERS = {
+    "h264": ["-c:v", "libx264", "-preset", "medium", "-crf", "12", "-pix_fmt", "yuv420p"],
+    "hevc": ["-c:v", "libx265", "-preset", "medium", "-crf", "14", "-pix_fmt", "yuv420p"],
+    "vp8": ["-c:v", "libvpx", "-crf", "10", "-b:v", "2M"],
+    "vp9": ["-c:v", "libvpx-vp9", "-crf", "18", "-b:v", "0"],
+}
+EDGE_VIDEO_ENCODERS_NVENC = {
+    "h264": ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "12"],
+    "hevc": ["-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "14"],
+}
+EDGE_AUDIO_ENCODERS = {
+    "aac": ["-c:a", "aac", "-b:a", "192k"],
+    "mp3": ["-c:a", "libmp3lame", "-q:a", "2"],
+    "opus": ["-c:a", "libopus", "-b:a", "160k"],
+    "vorbis": ["-c:a", "libvorbis", "-q:a", "5"],
+    "flac": ["-c:a", "flac"],
+}
+
+
+def get_keyframes(path):
+    """Lista os instantes (segundos) dos keyframes do vídeo, em ordem crescente."""
+    r = subprocess.run(
+        [FFPROBE, "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+         "-show_entries", "frame=pts_time", "-of", "csv=p=0", path],
+        capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return []
+    kfs = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                kfs.append(float(line))
+            except ValueError:
+                pass
+    kfs.sort()
+    return kfs
+
+
+def encode_edge(src, start, end, info, out_dir, tmp_files, use_nvenc):
+    """Recodifica com precisão de frame um trecho curto [start, end) de `src`.
+
+    Usado só nas bordas que não caem num keyframe: reencoda no MESMO codec de
+    origem para que o resultado possa ser concatenado por stream copy com o
+    restante do arquivo, sem quebrar a cadeia de referência de P-frames (causa
+    dos blocos corrompidos no preview ao cortar/remover trechos no meio do vídeo).
+    """
+    vcodec = info["video"]["codec"] if info["video"] else None
+    vargs = None
+    if use_nvenc and vcodec in EDGE_VIDEO_ENCODERS_NVENC:
+        vargs = EDGE_VIDEO_ENCODERS_NVENC[vcodec]
+    elif vcodec in EDGE_VIDEO_ENCODERS:
+        vargs = EDGE_VIDEO_ENCODERS[vcodec]
+    if vargs is None:
+        raise RuntimeError(
+            f"corte preciso não suportado para o codec de vídeo '{vcodec}'")
+    ext = os.path.splitext(src)[1]
+    tmp_out = os.path.join(out_dir, f".edge_{uuid.uuid4().hex[:8]}{ext}")
+    acodec = (EDGE_AUDIO_ENCODERS.get(info["audio"]["codec"], ["-c:a", "aac", "-b:a", "192k"])
+              if info["audio"] else ["-an"])
+
+    # busca de entrada (-ss antes de -i): rápida, mas alguns arquivos (ex.: gravações
+    # de tela VFR com um único keyframe) têm índice de seek problemático e o ffmpeg
+    # falha ao decodificar a partir do ponto buscado. Nesse caso cai para busca de
+    # saída (decodifica do início e corta depois) — mais lenta, porém sempre confiável.
+    fast_cmd = [FFMPEG, "-nostdin", "-y", "-ss", str(start), "-to", str(end),
+                "-i", src] + vargs + acodec + [tmp_out]
+    r = subprocess.run(fast_cmd, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        slow_cmd = [FFMPEG, "-nostdin", "-y", "-i", src, "-ss", str(start), "-to", str(end)] \
+            + vargs + acodec + [tmp_out]
+        r = subprocess.run(slow_cmd, capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(f"falha ao recodificar borda: {r.stderr.strip()[-300:]}")
+    tmp_files.append(tmp_out)
+    return tmp_out
+
+
+def build_segment(src, start, end, info, keyframes, out_dir, tmp_files, use_nvenc):
+    """Gera as linhas do concat-list representando o trecho [start, end) de `src`.
+
+    Se `start` já cai num keyframe (dentro de KEYFRAME_EPS), usa cópia direta
+    (rápido, comportamento original). Caso contrário, insere antes um pedaço
+    curto recodificado até o próximo keyframe, evitando que o restante — copiado
+    sem recodificar — comece com um P-frame sem sua referência (o que corrompe
+    o vídeo na reprodução).
+    """
+    esc = src.replace("'", "'\\''")
+    i = bisect.bisect_left(keyframes, start - KEYFRAME_EPS)
+    kf = keyframes[i] if i < len(keyframes) else None
+    aligned = kf is not None and abs(kf - start) <= KEYFRAME_EPS
+
+    if aligned:
+        lines = [f"file '{esc}'\n"]
+        if start > 0.01:
+            lines.append(f"inpoint {start}\n")
+        lines.append(f"outpoint {end}\n")
+        return lines
+
+    if kf is None or kf >= end:
+        # nenhum keyframe alcançável dentro do trecho: recodifica ele inteiro
+        edge = encode_edge(src, start, end, info, out_dir, tmp_files, use_nvenc)
+        edge_esc = edge.replace("'", "'\\''")
+        return [f"file '{edge_esc}'\n"]
+
+    edge = encode_edge(src, start, kf, info, out_dir, tmp_files, use_nvenc)
+    edge_esc = edge.replace("'", "'\\''")
+    return [f"file '{edge_esc}'\n", f"file '{esc}'\n",
+            f"inpoint {kf}\n", f"outpoint {end}\n"]
+
+
 def run_job(job_id, cmd, total_duration, output, cleanup=None):
     """Executa ffmpeg lendo -progress de stdout e atualiza jobs[job_id]."""
     try:
@@ -123,8 +239,10 @@ def run_job(job_id, cmd, total_duration, output, cleanup=None):
         with jobs_lock:
             jobs[job_id].update(status="error", error=str(e))
     finally:
-        if cleanup and os.path.exists(cleanup):
-            os.remove(cleanup)
+        paths = cleanup if isinstance(cleanup, list) else ([cleanup] if cleanup else [])
+        for c in paths:
+            if c and os.path.exists(c):
+                os.remove(c)
 
 
 def start_job(op, cmd, duration, output, cleanup=None):
@@ -142,12 +260,20 @@ def start_job(op, cmd, duration, output, cleanup=None):
 def op_cut(p):
     src = safe_path(p["input"])
     start, end = float(p["start"]), float(p["end"])
+    info = probe(src)
+    keyframes = get_keyframes(src)
     d, name = os.path.dirname(src), os.path.splitext(os.path.basename(src))
     out = unique_output(d, name[0], "corte", name[1])
+    tmp_files = []
+    lines = build_segment(src, start, end, info, keyframes, d, tmp_files, NVENC)
+    lst = out + ".txt"
+    with open(lst, "w") as f:
+        f.writelines(lines)
+    tmp_files.append(lst)
     cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
-           "-ss", str(start), "-to", str(end), "-i", src,
+           "-f", "concat", "-safe", "0", "-i", lst,
            "-c", "copy", "-avoid_negative_ts", "make_zero", out]
-    return start_job("cut", cmd, end - start, out)
+    return start_job("cut", cmd, end - start, out, cleanup=tmp_files)
 
 
 def op_join(p):
@@ -206,24 +332,29 @@ def op_delete(p):
     """Gera o vídeo SEM o intervalo [start, end], emendando o resto com -c copy."""
     src = safe_path(p["input"])
     start, end = float(p["start"]), float(p["end"])
-    dur = probe(src)["duration"]
+    info = probe(src)
+    dur = info["duration"]
     keep_head = start > 0.1
     keep_tail = end < dur - 0.1
     if not keep_head and not keep_tail:
         raise ValueError("o trecho marcado cobre o vídeo inteiro")
+    keyframes = get_keyframes(src)
     d, name = os.path.dirname(src), os.path.splitext(os.path.basename(src))
     out = unique_output(d, name[0], "semtrecho", name[1])
-    esc = src.replace("'", "'\\''")
+    tmp_files = []
+    lines = []
+    if keep_head:
+        lines += build_segment(src, 0.0, start, info, keyframes, d, tmp_files, NVENC)
+    if keep_tail:
+        lines += build_segment(src, end, dur, info, keyframes, d, tmp_files, NVENC)
     lst = out + ".txt"
     with open(lst, "w") as f:
-        if keep_head:
-            f.write(f"file '{esc}'\noutpoint {start}\n")
-        if keep_tail:
-            f.write(f"file '{esc}'\ninpoint {end}\n")
+        f.writelines(lines)
+    tmp_files.append(lst)
     cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
            "-f", "concat", "-safe", "0", "-i", lst,
            "-c", "copy", "-avoid_negative_ts", "make_zero", out]
-    return start_job("delete", cmd, dur - (end - start), out, cleanup=lst)
+    return start_job("delete", cmd, dur - (end - start), out, cleanup=tmp_files)
 
 
 def op_render(p):
@@ -232,21 +363,23 @@ def op_render(p):
     parts = [(float(s), float(e)) for s, e in p["parts"]]
     if not parts:
         raise ValueError("nenhum segmento restante para exportar")
+    info = probe(src)
+    keyframes = get_keyframes(src)
     d, name = os.path.dirname(src), os.path.splitext(os.path.basename(src))
     out = unique_output(d, name[0], "editado", name[1])
-    esc = src.replace("'", "'\\''")
+    tmp_files = []
+    lines = []
+    for s, e in parts:
+        lines += build_segment(src, s, e, info, keyframes, d, tmp_files, NVENC)
     lst = out + ".txt"
     with open(lst, "w") as f:
-        for s, e in parts:
-            f.write(f"file '{esc}'\n")
-            if s > 0.01:
-                f.write(f"inpoint {s}\n")
-            f.write(f"outpoint {e}\n")
+        f.writelines(lines)
+    tmp_files.append(lst)
     total = sum(e - s for s, e in parts)
     cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
            "-f", "concat", "-safe", "0", "-i", lst,
            "-c", "copy", "-avoid_negative_ts", "make_zero", out]
-    return start_job("render", cmd, total, out, cleanup=lst)
+    return start_job("render", cmd, total, out, cleanup=tmp_files)
 
 
 def op_render_convert(p):
