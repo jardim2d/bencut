@@ -4,6 +4,7 @@
 Uso: python3 server.py  →  http://localhost:8765
 """
 import bisect
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,12 @@ START_DIR = os.path.join(HOME, "Vídeos") if os.path.isdir(os.path.join(HOME, "V
 
 VIDEO_EXTS = {".mp4", ".mkv", ".m4v", ".mov", ".avi", ".webm", ".ts", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp"}
 AUDIO_COPY = {"aac": ".m4a", "mp3": ".mp3", "opus": ".opus", "flac": ".flac", "vorbis": ".ogg"}
+
+# formatos que o <video> do navegador reproduz nativamente; os demais (mkv,
+# avi, wmv, flv, ts, mpg, 3gp…) precisam de uma prévia transcodificada
+DIRECT_PLAYABLE_EXTS = {".mp4", ".m4v", ".mov", ".webm"}
+PREVIEW_CACHE_DIR = os.path.join(HOME, ".cache", "editorvideo", "previews")
+os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
 
 FFMPEG = shutil.which("ffmpeg") or os.path.join(HOME, ".local/bin/ffmpeg")
 FFPROBE = shutil.which("ffprobe") or os.path.join(HOME, ".local/bin/ffprobe")
@@ -81,8 +88,42 @@ def probe(path):
                              "fps": s.get("avg_frame_rate")}
         elif s["codec_type"] == "audio" and not info["audio"]:
             info["audio"] = {"codec": s.get("codec_name"),
-                             "channels": s.get("channels")}
+                             "channels": s.get("channels"),
+                             "sample_rate": s.get("sample_rate")}
     return info
+
+
+def needs_preview(path):
+    return os.path.splitext(path)[1].lower() not in DIRECT_PLAYABLE_EXTS
+
+
+def preview_cache_path(src):
+    """Caminho de cache determinístico por conteúdo (invalida se o arquivo mudar)."""
+    st = os.stat(src)
+    key = hashlib.sha1(f"{src}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()
+    return os.path.join(PREVIEW_CACHE_DIR, key + ".mp4")
+
+
+def build_preview_cmd(src, out, info):
+    """Gera uma prévia .mp4 tocável no navegador: remuxa (cópia) o que já for
+    compatível e recodifica só o que não for, para ficar o mais rápido possível."""
+    vcodec = info["video"]["codec"] if info["video"] else None
+    acodec = info["audio"]["codec"] if info["audio"] else None
+    cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats", "-i", src]
+    if vcodec == "h264":
+        cmd += ["-c:v", "copy"]
+    elif NVENC:
+        cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "23"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+    if acodec is None:
+        cmd += ["-an"]
+    elif acodec == "aac":
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", "160k"]
+    cmd += ["-movflags", "+faststart", out]
+    return cmd
 
 
 KEYFRAME_EPS = 0.05  # mesma tolerância usada no frontend (CUT_EPS)
@@ -163,6 +204,95 @@ def encode_edge(src, start, end, info, out_dir, tmp_files, use_nvenc):
         r = subprocess.run(slow_cmd, capture_output=True, text=True, timeout=600)
         if r.returncode != 0:
             raise RuntimeError(f"falha ao recodificar borda: {r.stderr.strip()[-300:]}")
+    tmp_files.append(tmp_out)
+    return tmp_out
+
+
+def atempo_chain(speed):
+    """O filtro atempo só aceita [0.5, 2.0]; encadeia para cobrir qualquer fator."""
+    filters, remaining = [], speed
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    filters.append(f"atempo={remaining:.6f}")
+    return ",".join(filters)
+
+
+def encode_speed(src, start, end, speed, info, out_dir, tmp_files, use_nvenc):
+    """Recodifica [start, end) de `src` já acelerado/desacelerado por `speed`x.
+
+    Sempre precisa recodificar (não dá pra mudar velocidade com stream copy);
+    usa o mesmo codec de origem para poder concatenar o resultado com o resto
+    do arquivo por stream copy quando o segmento vizinho não for alterado.
+    """
+    vcodec = info["video"]["codec"] if info["video"] else None
+    vargs = None
+    if use_nvenc and vcodec in EDGE_VIDEO_ENCODERS_NVENC:
+        vargs = EDGE_VIDEO_ENCODERS_NVENC[vcodec]
+    elif vcodec in EDGE_VIDEO_ENCODERS:
+        vargs = EDGE_VIDEO_ENCODERS[vcodec]
+    if vargs is None:
+        raise RuntimeError(
+            f"aceleração não suportada para o codec de vídeo '{vcodec}'")
+    ext = os.path.splitext(src)[1]
+    tmp_out = os.path.join(out_dir, f".speed_{uuid.uuid4().hex[:8]}{ext}")
+    vf = ["-vf", f"setpts=PTS/{speed}"]
+    if info["audio"]:
+        acodec = EDGE_AUDIO_ENCODERS.get(info["audio"]["codec"], ["-c:a", "aac", "-b:a", "192k"])
+        aargs = ["-af", atempo_chain(speed)] + acodec
+    else:
+        aargs = ["-an"]
+
+    fast_cmd = [FFMPEG, "-nostdin", "-y", "-ss", str(start), "-to", str(end),
+                "-i", src] + vf + vargs + aargs + [tmp_out]
+    r = subprocess.run(fast_cmd, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        slow_cmd = [FFMPEG, "-nostdin", "-y", "-i", src, "-ss", str(start), "-to", str(end)] \
+            + vf + vargs + aargs + [tmp_out]
+        r = subprocess.run(slow_cmd, capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(f"falha ao acelerar trecho: {r.stderr.strip()[-300:]}")
+    tmp_files.append(tmp_out)
+    return tmp_out
+
+
+def encode_black(dur, info, src, out_dir, tmp_files, use_nvenc):
+    """Gera um clipe de `dur` s de tela preta + silêncio, no MESMO codec/resolução/
+    fps/áudio do source, para representar uma lacuna e ser concatenado com os demais
+    trechos (o concat demuxer exige mesmo codec)."""
+    v = info.get("video") or {}
+    vcodec = v.get("codec")
+    if use_nvenc and vcodec in EDGE_VIDEO_ENCODERS_NVENC:
+        vargs = EDGE_VIDEO_ENCODERS_NVENC[vcodec]
+    elif vcodec in EDGE_VIDEO_ENCODERS:
+        vargs = EDGE_VIDEO_ENCODERS[vcodec]
+    else:
+        raise RuntimeError(f"lacuna preta não suportada para o codec de vídeo '{vcodec}'")
+    w = int(v.get("width") or 1920)
+    h = int(v.get("height") or 1080)
+    fps = str(v.get("fps") or "30/1")
+    if "/" in fps:
+        n, _, den = fps.partition("/")
+        if not n or n == "0" or not den or den == "0":
+            fps = "30/1"
+    ext = os.path.splitext(src)[1]
+    tmp_out = os.path.join(out_dir, f".black_{uuid.uuid4().hex[:8]}{ext}")
+    inputs = ["-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={fps}"]
+    if info.get("audio"):
+        sr = info["audio"].get("sample_rate") or "48000"
+        cl = "mono" if (info["audio"].get("channels") or 2) == 1 else "stereo"
+        inputs += ["-f", "lavfi", "-i", f"anullsrc=r={sr}:cl={cl}"]
+        aargs = EDGE_AUDIO_ENCODERS.get(info["audio"]["codec"], ["-c:a", "aac", "-b:a", "192k"])
+    else:
+        aargs = ["-an"]
+    cmd = [FFMPEG, "-nostdin", "-y"] + inputs + ["-t", f"{dur:.4f}"] \
+        + vargs + ["-pix_fmt", "yuv420p"] + aargs + [tmp_out]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(f"falha ao gerar lacuna preta: {r.stderr.strip()[-300:]}")
     tmp_files.append(tmp_out)
     return tmp_out
 
@@ -299,14 +429,22 @@ def op_convert(p):
     duration = probe(src)["duration"]
     d, name = os.path.dirname(src), os.path.splitext(os.path.basename(src))
     out = unique_output(d, name[0], "convertido", "." + ext)
-    cq = {"alta": "19", "media": "23", "baixa": "28"}[quality]
     cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats", "-i", src]
-    if NVENC and p.get("gpu", True):
-        cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", cq,
-                "-b:v", "0"]
+    if ext == "webm":
+        # NVENC não codifica VP9 (só decodifica em algumas placas); sempre CPU.
+        cq = {"alta": "24", "media": "31", "baixa": "37"}[quality]
+        cmd += ["-c:v", "libvpx-vp9", "-crf", cq, "-b:v", "0",
+                "-row-mt", "1", "-cpu-used", "2",
+                "-c:a", "libopus", "-b:a", "128k"]
     else:
-        cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", cq]
-    cmd += ["-c:a", "aac", "-b:a", "160k", out]
+        cq = {"alta": "19", "media": "23", "baixa": "28"}[quality]
+        if NVENC and p.get("gpu", True):
+            cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", cq,
+                    "-b:v", "0"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", cq]
+        cmd += ["-c:a", "aac", "-b:a", "160k"]
+    cmd += [out]
     return start_job("convert", cmd, duration, out)
 
 
@@ -358,24 +496,34 @@ def op_delete(p):
 
 
 def op_render(p):
-    """Monta o vídeo a partir dos segmentos mantidos [[start, end], ...], com -c copy."""
+    """Monta o vídeo a partir dos segmentos mantidos [[start, end, speed], ...], com
+    -c copy — segmentos com speed != 1 são recodificados antes (não dá pra mudar
+    velocidade com stream copy) e emendados aos demais igual às bordas de corte."""
     src = safe_path(p["input"])
-    parts = [(float(s), float(e)) for s, e in p["parts"]]
+    parts = [(float(x[0]), float(x[1]), float(x[2]), float(x[3]) if len(x) > 3 else 0.0)
+             for x in p["parts"]]
     if not parts:
         raise ValueError("nenhum segmento restante para exportar")
     info = probe(src)
     keyframes = get_keyframes(src)
     d, name = os.path.dirname(src), os.path.splitext(os.path.basename(src))
-    out = unique_output(d, name[0], "editado", name[1])
+    out = safe_path(p["output"]) if p.get("output") else unique_output(d, name[0], "editado", name[1])
     tmp_files = []
     lines = []
-    for s, e in parts:
-        lines += build_segment(src, s, e, info, keyframes, d, tmp_files, NVENC)
+    for s, e, sp, gap in parts:
+        if gap > 0.001:   # lacuna → trecho de preto+silêncio antes do segmento
+            blk = encode_black(gap, info, src, d, tmp_files, NVENC)
+            lines.append(f"file '{blk.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
+        if abs(sp - 1.0) > 1e-6:
+            seg = encode_speed(src, s, e, sp, info, d, tmp_files, NVENC)
+            lines.append(f"file '{seg.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
+        else:
+            lines += build_segment(src, s, e, info, keyframes, d, tmp_files, NVENC)
     lst = out + ".txt"
     with open(lst, "w") as f:
         f.writelines(lines)
     tmp_files.append(lst)
-    total = sum(e - s for s, e in parts)
+    total = sum((e - s) / sp + gap for s, e, sp, gap in parts)
     cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
            "-f", "concat", "-safe", "0", "-i", lst,
            "-c", "copy", "-avoid_negative_ts", "make_zero", out]
@@ -383,28 +531,41 @@ def op_render(p):
 
 
 def op_render_convert(p):
-    """Exporta os segmentos e recodifica para um novo formato."""
+    """Exporta os segmentos e recodifica para um novo formato. Segmentos com
+    speed != 1 passam antes por encode_speed (todo o resto já é recodificado
+    aqui mesmo, então não precisa casar codec nem alinhar keyframe)."""
     src = safe_path(p["input"])
-    parts = [(float(s), float(e)) for s, e in p["parts"]]
+    parts = [(float(x[0]), float(x[1]), float(x[2]), float(x[3]) if len(x) > 3 else 0.0)
+             for x in p["parts"]]
     fmt = p.get("format", "mp4")
     if not parts:
         raise ValueError("nenhum segmento restante para exportar")
+    info = probe(src)
     d, name = os.path.dirname(src), os.path.splitext(os.path.basename(src))
-    out = unique_output(d, name[0], "editado", "." + fmt)
+    out = safe_path(p["output"]) if p.get("output") else unique_output(d, name[0], "editado", "." + fmt)
     esc = src.replace("'", "'\\''")
+    tmp_files = []
     lst = out + ".txt"
     with open(lst, "w") as f:
-        for s, e in parts:
-            f.write(f"file '{esc}'\n")
-            if s > 0.01:
-                f.write(f"inpoint {s}\n")
-            f.write(f"outpoint {e}\n")
-    total = sum(e - s for s, e in parts)
+        for s, e, sp, gap in parts:
+            if gap > 0.001:
+                blk = encode_black(gap, info, src, d, tmp_files, NVENC)
+                f.write(f"file '{blk.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
+            if abs(sp - 1.0) > 1e-6:
+                seg = encode_speed(src, s, e, sp, info, d, tmp_files, NVENC)
+                f.write(f"file '{seg.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
+            else:
+                f.write(f"file '{esc}'\n")
+                if s > 0.01:
+                    f.write(f"inpoint {s}\n")
+                f.write(f"outpoint {e}\n")
+    tmp_files.append(lst)
+    total = sum((e - s) / sp + gap for s, e, sp, gap in parts)
     cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
            "-f", "concat", "-safe", "0", "-i", lst,
            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
            "-c:a", "aac", "-b:a", "160k", out]
-    return start_job("render_convert", cmd, total, out, cleanup=lst)
+    return start_job("render_convert", cmd, total, out, cleanup=tmp_files)
 
 
 OPS = {"cut": op_cut, "join": op_join, "convert": op_convert,
@@ -527,6 +688,42 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/api/media":
             return self._media(q.get("path", [""])[0])
+
+        if route == "/api/preview":
+            try:
+                src = safe_path(q["path"][0])
+                if not needs_preview(src):
+                    return self._json({"ready": True, "path": src})
+                out = preview_cache_path(src)
+                if os.path.exists(out):
+                    return self._json({"ready": True, "path": out})
+                info = probe(src)
+                job_id = start_job("preview", build_preview_cmd(src, out, info),
+                                   info["duration"], out)
+                return self._json({"ready": False, "job": job_id})
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
+        if route == "/api/pick-save":
+            try:
+                src = safe_path(q["input"][0])
+                ext = (q.get("ext", [None])[0] or os.path.splitext(src)[1].lstrip(".")).lstrip(".")
+                suffix = q.get("suffix", ["editado"])[0]
+                d, name = os.path.dirname(src), os.path.splitext(os.path.basename(src))
+                suggested = unique_output(d, name[0], suffix, "." + ext)
+                r = subprocess.run(
+                    ["zenity", "--file-selection", "--save", "--confirm-overwrite",
+                     "--title=Salvar vídeo exportado", f"--filename={suggested}"],
+                    capture_output=True, text=True, timeout=600)
+                if r.returncode != 0:
+                    return self._json({"cancelled": True})
+                chosen = safe_path(r.stdout.strip())
+                return self._json({"path": chosen})
+            except FileNotFoundError:
+                return self._json(
+                    {"error": "zenity não encontrado (instale: sudo apt install zenity)"}, 500)
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
 
         if route == "/api/jobs":
             with jobs_lock:
