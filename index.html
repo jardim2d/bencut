@@ -12,17 +12,42 @@
   <div id="browser">
     <div id="browser-path"></div>
     <ul id="browser-list"></ul>
+    <div id="browser-grid"></div>
   </div>
+</aside>
 
-  <div id="ops">
-    <div class="section">
-      <h2>Juntar</h2>
-      <ul id="join-list"></ul>
-      <button id="btn-join" class="primary" disabled>Juntar</button>
-    </div>
+<!-- área central: topo → 4/5 da tela -->
+<section id="center">
+  <header>
+    <h1>EditorVideo</h1>
+    <span id="gpu-badge" class="badge"></span>
+    <div class="spacer"></div>
+    <button id="btn-undo" class="icon" title="Desfazer (Ctrl+Z)" disabled><img src="/icons/undo.svg" alt="Desfazer"></button>
+    <button id="btn-redo" class="icon" title="Refazer (Ctrl+Y)" disabled><img src="/icons/redo.svg" alt="Refazer"></button>
+    <button id="btn-save" class="icon" title="Salvar projeto para retomar depois" disabled><img src="/icons/save.svg" alt="Salvar projeto"></button>
+    <button id="btn-open" class="icon" title="Abrir projeto salvo (.evp)"><img src="/icons/open.svg" alt="Abrir projeto"></button>
+  </header>
+  <div id="player-wrap">
+    <video id="player" controls></video>
+    <div id="gap-overlay"></div>
+    <div id="player-empty">Arraste um vídeo da lista para a timeline abaixo</div>
+  </div>
+  <div id="file-info"></div>
+</section>
 
-    <div class="section">
-      <h2>Converter</h2>
+<!-- faixa inferior: 1/5 da tela, largura total, timeline -->
+<footer id="bottom">
+  <div id="cut-controls">
+    <button id="btn-cut" disabled title="Tecla C"><img src="/icons/cut.svg" alt="">Corte</button>
+    <button id="btn-del-seg" class="danger" disabled title="Deletar segmento (tecla Delete)"><img src="/icons/delete.svg" alt="">Deletar</button>
+    <select id="seg-speed" disabled title="Velocidade do segmento selecionado">
+      <option value="1">1x</option>
+      <option value="1.5">1.5x</option>
+      <option value="2">2x</option>
+      <option value="2.5">2.5x</option>
+      <option value="3">3x</option>
+    </select>
+    <div id="conv-opts">
       <label>Formato
         <select id="conv-format">
           <option value="mp4" selected>MP4</option>
@@ -37,45 +62,9 @@
         </select>
       </label>
       <label id="gpu-label"><span>GPU (NVENC)</span><input type="checkbox" id="conv-gpu" checked></label>
-      <button id="btn-convert" class="primary" disabled>Converter</button>
+      <button id="btn-convert" class="primary" disabled><img src="/icons/convert.svg" alt="">Converter</button>
     </div>
-
-    <div class="section">
-      <h2>Áudio</h2>
-      <button id="btn-extract" class="primary" disabled>Extrair áudio</button>
-    </div>
-  </div>
-</aside>
-
-<!-- área central: topo → 4/5 da tela -->
-<section id="center">
-  <header>
-    <h1>EditorVideo</h1>
-    <span id="gpu-badge" class="badge"></span>
-    <div class="spacer"></div>
-    <button id="btn-undo" class="icon" title="Desfazer (Ctrl+Z)" disabled>↩</button>
-    <button id="btn-redo" class="icon" title="Refazer (Ctrl+Y)" disabled>↪</button>
-  </header>
-  <div id="player-wrap">
-    <video id="player" controls></video>
-    <div id="gap-overlay"></div>
-    <div id="player-empty">Selecione um vídeo à esquerda</div>
-  </div>
-  <div id="file-info"></div>
-</section>
-
-<!-- faixa inferior: 1/5 da tela, largura total, timeline -->
-<footer id="bottom">
-  <div id="cut-controls">
-    <button id="btn-cut" disabled>Corte <kbd>C</kbd></button>
-    <button id="btn-del-seg" class="danger" disabled title="Tecla Delete">Deletar segmento</button>
-    <select id="seg-speed" disabled title="Velocidade do segmento selecionado">
-      <option value="1">1x</option>
-      <option value="1.5">1.5x</option>
-      <option value="2">2x</option>
-      <option value="2.5">2.5x</option>
-      <option value="3">3x</option>
-    </select>
+    <button id="btn-extract" disabled title="Extrair áudio do vídeo"><img src="/icons/audio.svg" alt="">Extrair</button>
     <div id="export-opts" class="hidden">
       <label>Formato
         <select id="export-format">
@@ -83,10 +72,10 @@
           <option value="mp4">MP4 (recodifica)</option>
         </select>
       </label>
-      <button id="btn-export-go" class="primary">Exportar</button>
+      <button id="btn-export-go" class="primary"><img src="/icons/save.svg" alt="">Exportar</button>
       <button id="btn-export-cancel">Cancelar</button>
     </div>
-    <button id="btn-export" class="primary" disabled>Exportar</button>
+    <button id="btn-export" class="primary" disabled><img src="/icons/export.svg" alt="">Exportar</button>
     <span id="mark-info"></span>
     <div id="jobs-bar"></div>
   </div>

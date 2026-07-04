@@ -14,7 +14,6 @@ const api = async (path, opts) => {
 // em dois e "Deletar" marca o segmento para ficar fora da exportação.
 const state = {
   segments: [],   // [{start, end, deleted, speed}] cobrindo o vídeo inteiro
-  joinQueue: [],  // [paths]
 };
 const history = { past: [], future: [] };
 const MAX_HISTORY = 50;
@@ -43,11 +42,18 @@ function redo() {
 }
 
 // ---------- estado não-histórico ----------
-let currentPath = null;   // vídeo carregado no player
-let currentInfo = null;   // resultado do probe
-let selectedSeg = null;   // índice do segmento selecionado na timeline
+// A timeline pode conter trechos de VÁRIOS arquivos (arrastar soma na timeline).
+// Cada segmento carrega seu `src`; `sources` guarda o probe e a mídia tocável de
+// cada arquivo; `activeSrc` é o arquivo atualmente carregado no <video>.
+const sources = new Map();   // path -> { info, media, ready, err }
+let activeSrc = null;        // arquivo carregado no player agora
+let wantTime = 0;            // instante-alvo a buscar após trocar o src do player
+let selectedSeg = null;      // índice do segmento selecionado na timeline
 let nvenc = false;
 const CUT_EPS = 0.05;     // distância mínima do corte até a borda do segmento
+
+const activeInfo = () => sources.get(activeSrc)?.info || null;
+const distinctSrcs = () => [...new Set(state.segments.filter(s => !s.deleted).map(s => s.src))];
 
 // ---------- helpers ----------
 const fmtTime = (s) => {
@@ -60,7 +66,14 @@ const fmtTime = (s) => {
 const fmtSize = (b) => b > 1e9 ? (b / 1e9).toFixed(2) + " GB"
   : b > 1e6 ? (b / 1e6).toFixed(1) + " MB" : Math.round(b / 1e3) + " kB";
 const basename = (p) => p.split("/").pop();
-const videoDur = () => currentInfo?.duration || player.duration || 0;
+const activeDur = () => activeInfo()?.duration || player.duration || 0;
+const hasContent = () => state.segments.length > 0;   // há algo na timeline?
+
+// cor própria de cada segmento: matiz gerado por ângulo áureo (cores sempre bem
+// separadas) e guardado no segmento — assim acompanha o trecho ao reordenar e
+// sobrevive a undo/redo. Início aleatório para variar entre sessões.
+let hueSeed = Math.floor(Math.random() * 360);
+const nextHue = () => { const h = Math.round(hueSeed) % 360; hueSeed += 137.508; return h; };
 
 // rótulo da régua da timeline: mm:ss (ou h:mm:ss), sem décimos
 const fmtRuler = (s) => {
@@ -74,6 +87,33 @@ const niceStep = (target) => RULER_STEPS.find(s => s >= target) || RULER_STEPS[R
 
 // ---------- navegador de arquivos ----------
 let browseDir = null;
+let selectedFile = null;   // arquivo destacado por clique na lista (não carrega nada)
+
+// clicar num arquivo o SELECIONA (destaque persistente na lista), sem enviá-lo
+// à timeline — carregar continua sendo só pelo arraste.
+function selectFile(path) {
+  selectedFile = path;
+  document.querySelectorAll("#browser [data-path]").forEach(el =>
+    el.classList.toggle("selected", el.dataset.path === path));
+}
+
+// duração por arquivo (badge do card), buscada aos poucos e cacheada
+const metaCache = new Map();   // path -> duration (s)
+
+async function fillDurations(grid) {
+  for (const card of [...grid.querySelectorAll(".card:not(.project)")]) {
+    if (!card.isConnected) return;       // usuário navegou p/ outra pasta
+    const path = card.dataset.path;
+    let dur = metaCache.get(path);
+    if (dur === undefined) {
+      try {
+        dur = (await api("/api/meta?path=" + encodeURIComponent(path))).duration;
+      } catch { dur = 0; }
+      metaCache.set(path, dur);
+    }
+    if (dur > 0) card.querySelector(".dur").textContent = fmtRuler(dur);
+  }
+}
 
 async function browse(dir) {
   const data = await api("/api/list?dir=" + encodeURIComponent(dir));
@@ -83,8 +123,9 @@ async function browse(dir) {
   ul.innerHTML = "";
 
   const li = document.createElement("li");
-  li.className = "dir";
-  li.innerHTML = "<span>..</span>";
+  li.className = "dir up";
+  li.title = "Voltar para a pasta anterior";
+  li.innerHTML = `<img src="/icons/back.svg" alt="Voltar">`;
   li.onclick = () => browse(data.parent);
   ul.appendChild(li);
 
@@ -95,77 +136,155 @@ async function browse(dir) {
     li.onclick = () => browse(data.dir + "/" + d);
     ul.appendChild(li);
   }
+
+  // arquivos: cards com miniatura, duração e nome
+  const grid = $("browser-grid");
+  grid.innerHTML = "";
   for (const f of data.files) {
     const full = data.dir + "/" + f.name;
-    const li = document.createElement("li");
-    li.dataset.path = full;
-    li.innerHTML = `<span class="name">${f.name}</span>` +
-      `<span class="size">${fmtSize(f.size)}</span>` +
-      `<button class="add-join" title="Adicionar à fila de junção">＋</button>`;
-    li.querySelector(".add-join").onclick = (e) => {
-      e.stopPropagation();
-      apply(s => s.joinQueue.push(full));
+    const isProject = f.name.toLowerCase().endsWith(".evp");
+    const card = document.createElement("div");
+    card.className = isProject ? "card project" : "card";
+    card.dataset.path = full;
+    card.draggable = true;             // arraste para a timeline abre o vídeo p/ edição
+    card.title = f.name + (isProject
+      ? "\nProjeto salvo — clique para retomar a edição"
+      : "\nClique para pré-visualizar · arraste para a timeline para editar");
+    if (full === selectedFile) card.classList.add("selected");
+    card.innerHTML =
+      `<div class="thumb"><img loading="lazy" alt=""><span class="dur"></span></div>` +
+      `<div class="name">${f.name}</div><div class="size">${fmtSize(f.size)}</div>`;
+    const img = card.querySelector("img");
+    img.src = isProject ? "/icons/save.svg" : "/api/thumb?path=" + encodeURIComponent(full);
+    img.onerror = () => img.remove();  // sem miniatura: fica o ícone de fundo
+    card.addEventListener("dragstart", (e) => {
+      e.dataTransfer.setData("text/plain", full);
+      e.dataTransfer.effectAllowed = "copy";
+    });
+    card.onclick = () => {                   // clicar seleciona; projeto retoma a
+      selectFile(full);                      // edição, vídeo só pré-visualiza
+      isProject ? loadProject(full) : previewFile(full);
     };
-    li.onclick = () => loadVideo(full);
-    ul.appendChild(li);
+    grid.appendChild(card);
   }
+  fillDurations(grid);
 }
 
 // ---------- player ----------
 const player = $("player");
 
-async function loadVideo(path) {
-  currentPath = path;
-  selectedSeg = null;
-  cancelAnimationFrame(layoutAnimId);
-  animPos.clear();
-  animDur = 0;
-  tlZoom = 1; tlView = 0;   // reinicia zoom/pan da timeline
-  gapVisible = null; gapHold = null; prevKeptIdx = -1; setGapOverlay(false);
-  apply(s => { s.segments = []; });
-  document.querySelectorAll("#browser-list li").forEach(li =>
-    li.classList.toggle("selected", li.dataset.path === path));
-  $("player-wrap").classList.add("has-video");
-  player.removeAttribute("src");
+// arrastar um arquivo SOMA-o ao fim da timeline (não substitui). Os appends são
+// encadeados numa fila para preservar a ordem de solta mesmo com probes lentos.
+let appendChain = Promise.resolve();
+function addToTimeline(path) {
+  appendChain = appendChain.then(() => appendOne(path)).catch(() => {});
+  return appendChain;
+}
+
+// garante probe + preparo da mídia tocável de um arquivo; null se o probe falhar
+async function ensureSource(path) {
+  let s = sources.get(path);
+  if (s) return s;
   $("file-info").textContent = basename(path) + " — carregando info…";
-  ["btn-convert", "btn-extract"].forEach(id => $(id).disabled = false);
-  preparePreview(path);
+  let info;
   try {
-    const info = await api("/api/probe?path=" + encodeURIComponent(path));
-    if (path !== currentPath) return;
-    currentInfo = info;
-    const v = info.video, a = info.audio;
-    $("file-info").textContent = basename(path) +
-      ` — ${fmtTime(info.duration)}` +
-      (v ? ` · ${v.width}×${v.height} ${v.codec}` : "") +
-      (a ? ` · áudio ${a.codec}` : " · sem áudio") +
-      ` · ${fmtSize(info.size)}`;
-    if (info.duration > 0)
-      apply(s => { s.segments = [{ start: 0, end: info.duration, deleted: false, speed: 1, gap: 0 }]; });
+    info = await api("/api/probe?path=" + encodeURIComponent(path));
   } catch (e) {
-    if (path !== currentPath) return;
-    currentInfo = null;
     $("file-info").textContent = basename(path) + " — erro no probe: " + e.message;
+    return null;
   }
+  s = { info, media: null, ready: false, err: null };
+  sources.set(path, s);
+  prepareSource(path);   // transcodifica a prévia em paralelo (se necessário)
+  return s;
+}
+
+// pré-visualização: clique num card carrega o arquivo SÓ no player, sem tocar
+// na timeline — serve para escolher o vídeo antes de editar. Desabilitada
+// enquanto houver conteúdo na timeline (não atrapalha uma edição em curso).
+async function previewFile(path) {
+  if (hasContent()) return;
+  const s = await ensureSource(path);
+  if (!s) return;
+  if (hasContent() || selectedFile !== path) return;   // situação mudou durante o await
+  $("player-wrap").classList.add("has-video");
+  switchPlayerTo(path, 0);
+}
+
+async function appendOne(path) {
+  const s = await ensureSource(path);
+  if (!s) return;
+  const dur = s.info.duration || 0;
+  if (dur <= 0) {
+    $("file-info").textContent = basename(path) + " — duração desconhecida, não adicionado";
+    return;
+  }
+  const first = state.segments.length === 0;
+  $("player-wrap").classList.add("has-video");
+  apply(st => st.segments.push(
+    { src: path, start: 0, end: dur, deleted: false, speed: 1, gap: 0, hue: nextHue() }));
+  if (first || !activeSrc) {           // primeiro conteúdo: carrega no player
+    tlZoom = 1; tlView = 0;
+    switchPlayerTo(path, 0);
+  }
+  updateActiveUI();
   drawTimeline();
 }
 
-// prepara o preview: formatos que o <video> não toca nativamente (mkv, avi,
-// wmv, flv, ts, mpg, 3gp…) são transcodificados sob demanda pelo servidor
-// (com cache) antes de virar o src do player.
-async function preparePreview(path) {
+// prepara a mídia tocável de um arquivo: formatos que o <video> não toca
+// nativamente (mkv, avi, wmv, flv, ts, mpg, 3gp…) são transcodificados sob
+// demanda pelo servidor (com cache). Guarda a URL final em sources[path].media.
+async function prepareSource(path) {
+  const s = sources.get(path);
+  if (!s || s.media) return;
   try {
     const r = await api("/api/preview?path=" + encodeURIComponent(path));
-    if (path !== currentPath) return;
-    if (r.ready) { player.src = "/api/media?path=" + encodeURIComponent(r.path); return; }
-    startPolling();
-    const job = await pollJob(r.job);
-    if (path !== currentPath) return;
-    player.src = "/api/media?path=" + encodeURIComponent(job.output);
+    if (r.ready) {
+      s.media = "/api/media?path=" + encodeURIComponent(r.path);
+    } else {
+      startPolling();
+      const job = await pollJob(r.job);
+      s.media = "/api/media?path=" + encodeURIComponent(job.output);
+    }
+    s.ready = true;
+    // se este arquivo é o ativo e estava esperando a mídia, carrega agora
+    if (activeSrc === path && !player.getAttribute("src")) switchPlayerTo(path, wantTime);
   } catch (e) {
-    if (path === currentPath)
+    s.err = e.message;
+    if (activeSrc === path)
       $("file-info").textContent += " · erro na pré-visualização: " + e.message;
   }
+}
+
+// troca o arquivo carregado no <video> (usado ao cruzar a fronteira entre
+// trechos de arquivos diferentes). Se a mídia ainda não está pronta, aguarda —
+// prepareSource re-chama quando terminar.
+function switchPlayerTo(src, t) {
+  activeSrc = src;
+  wantTime = t || 0;
+  const s = sources.get(src);
+  if (s && s.media) {
+    if (player.getAttribute("src") !== s.media) player.src = s.media; // busca no loadedmetadata
+    else { player.currentTime = wantTime; drawTimeline(); }
+  } else {
+    player.removeAttribute("src");
+  }
+  updateActiveUI();
+}
+
+// reflete o arquivo ativo na UI: seleção na lista, info e botões de operação
+function updateActiveUI() {
+  ["btn-convert", "btn-extract"].forEach(id => $(id).disabled = !activeSrc);
+  const info = activeInfo();
+  if (!info) return;
+  const v = info.video, a = info.audio, n = distinctSrcs().length;
+  $("file-info").textContent = basename(activeSrc) +
+    ` — ${fmtTime(info.duration)}` +
+    (v ? ` · ${v.width}×${v.height} ${v.codec}` : "") +
+    (a ? ` · áudio ${a.codec}` : " · sem áudio") +
+    ` · ${fmtSize(info.size)}` +
+    (n > 1 ? `  ·  ${n} arquivos na timeline` : "") +
+    (!hasContent() ? "  ·  pré-visualização — arraste para a timeline para editar" : "");
 }
 
 // espera um job terminar, consultando /api/jobs (mesma fonte usada pela
@@ -187,10 +306,12 @@ function pollJob(jobId, intervalMs = 500) {
   });
 }
 
-// fallback: se o probe falhar, cria o segmento inicial pela duração do player
+// ao (re)carregar um arquivo no player, posiciona no instante pedido pela troca
 player.addEventListener("loadedmetadata", () => {
-  if (currentPath && !state.segments.length && player.duration)
-    apply(s => { s.segments = [{ start: 0, end: player.duration, deleted: false, speed: 1, gap: 0 }]; });
+  if (wantTime && Math.abs(player.currentTime - wantTime) > 0.05) {
+    try { player.currentTime = wantTime; } catch (_) { /* fora do alcance */ }
+  }
+  drawTimeline();
 });
 
 // ---------- timeline (ripple: deletados somem e o resto desliza) ----------
@@ -204,7 +325,7 @@ let animPos = new Map();   // segKey -> início visível animado (s)
 let animDur = 0;           // duração visível animada (s)
 let layoutAnimId = null;
 
-const segKey = (s) => s.start.toFixed(3) + ":" + s.end.toFixed(3);
+const segKey = (s) => s.src + "@" + s.start.toFixed(3) + ":" + s.end.toFixed(3);
 const keptSegs = () => state.segments.filter(s => !s.deleted);
 
 function targetLayout() {
@@ -245,7 +366,7 @@ function startLayoutAnim(target, targetDur) {
     animDur = fromDur + (targetDur - fromDur) * e;
     // reancora: mantém o conteúdo do centro parado enquanto a junção compacta
     if (panAnchorSrc != null) {
-      tlView = sourceToVisible(panAnchorSrc) - 0.5 * tlSpan();
+      tlView = sourceToVisible(panAnchorSrc.src, panAnchorSrc.t) - 0.5 * tlSpan();
       clampView();
     }
     drawTimeline();
@@ -255,32 +376,35 @@ function startLayoutAnim(target, targetDur) {
   layoutAnimId = requestAnimationFrame(step);
 }
 
-// tempo do arquivo → posição visível na timeline (usa o layout animado)
-function sourceToVisible(t) {
+// tempo (arquivo `src`, instante `t`) → posição visível na timeline (layout animado)
+function sourceToVisible(src, t) {
   let prevEnd = 0;
   for (const s of keptSegs()) {
     const p = animPos.get(segKey(s)) ?? 0;
-    if (t < s.start) return p;               // dentro de parte deletada
-    if (t <= s.end) return p + (t - s.start);
+    if (s.src === src) {
+      if (t < s.start) return p;             // dentro de parte deletada deste arquivo
+      if (t <= s.end) return p + (t - s.start);
+    }
     prevEnd = p + (s.end - s.start);
   }
   return prevEnd;
 }
 
-// posição visível → tempo do arquivo (usa o layout final, estável).
+// posição visível → { src, t } do arquivo (usa o layout final, estável).
 // Se cair numa lacuna, devolve o início (fonte) do próximo trecho.
 function visibleToSource(tv) {
   const kept = keptSegs();
-  if (!kept.length) return Math.max(0, Math.min(1, tv / videoDur())) * videoDur();
+  if (!kept.length) return { src: activeSrc, t: 0 };
   let acc = 0;
   for (const s of kept) {
     acc += s.gap || 0;               // pula a lacuna preta antes do trecho
     const d = s.end - s.start;
-    if (tv < acc) return s.start;     // dentro da lacuna → início do trecho seguinte
-    if (tv <= acc + d) return s.start + (tv - acc);
+    if (tv < acc) return { src: s.src, t: s.start };     // na lacuna → início do trecho seguinte
+    if (tv <= acc + d) return { src: s.src, t: s.start + (tv - acc) };
     acc += d;
   }
-  return kept[kept.length - 1].end;
+  const l = kept[kept.length - 1];
+  return { src: l.src, t: l.end };
 }
 
 // true se a posição visível tv cai numa lacuna preta (entre trechos)
@@ -328,7 +452,7 @@ function drawTimeline() {
   const w = canvas.width = canvas.clientWidth * dpr;
   const h = canvas.height = canvas.clientHeight * dpr;
   ctx.clearRect(0, 0, w, h);
-  if (!videoDur() || animDur <= 0) return;
+  if (!hasContent() || animDur <= 0) return;
   const kept = keptSegs();
   if (!kept.length) return;
   clampView();
@@ -359,19 +483,18 @@ function drawTimeline() {
     }
     const x0 = sx(visStart);
     const wd = (s.end - s.start) * scale;
-    const isSped = s.speed && s.speed !== 1;
-    ctx.fillStyle = isSped
-      ? (i === selectedSeg ? "rgba(232,127,10,.55)" : "rgba(232,127,10,.3)")
-      : (i === selectedSeg ? "rgba(64,183,227,.5)" : "rgba(64,183,227,.28)");
+    const sel = i === selectedSeg;
+    const hue = s.hue ?? 210;                    // cor própria e estável do segmento
+    ctx.fillStyle = `hsla(${hue}, 62%, 55%, ${sel ? 0.82 : 0.55})`;
     ctx.fillRect(x0, segTop, wd, segH);
-    if (i === selectedSeg) {
-      ctx.strokeStyle = "#40B7E3";
+    if (sel) {                                   // seleção: borda branca destacada
+      ctx.strokeStyle = "rgba(255,255,255,.92)";
       ctx.lineWidth = 2 * dpr;
       ctx.strokeRect(x0 + 1, segTop + 1, wd - 2, segH - 2);
     }
-    if (isSped && wd > 20 * dpr) {
-      ctx.fillStyle = "#ffa733";
-      ctx.font = `${10 * dpr}px system-ui, sans-serif`;
+    if (s.speed && s.speed !== 1 && wd > 20 * dpr) {
+      ctx.fillStyle = "#fff";
+      ctx.font = `bold ${10 * dpr}px system-ui, sans-serif`;
       ctx.textBaseline = "top";
       ctx.fillText(`${s.speed}x`, x0 + 4 * dpr, segTop + 2 * dpr);
     }
@@ -381,7 +504,7 @@ function drawTimeline() {
   drawRuler(w, h, rulerH, scale);
 
   // cursor de reprodução (posição compactada; numa lacuna usa o playhead virtual)
-  const playVis = gapVisible != null ? gapVisible : sourceToVisible(player.currentTime);
+  const playVis = gapVisible != null ? gapVisible : sourceToVisible(activeSrc, player.currentTime);
   const cx = sx(playVis);
   ctx.fillStyle = "#e87f0a";
   ctx.fillRect(cx - 1, 0, 3, h);
@@ -438,9 +561,14 @@ let scrubbing = false, wasPlaying = false, pendingSeek = null;
 // arraste de um segmento SELECIONADO para afastá-lo (criar/ajustar lacuna preta)
 let segMoving = false, segMoveIdx = -1, segMoveOrigGap = 0, segMoveSpan0 = 0, segMoveHist = false;
 let segMoveNextIdx = -1, segMoveOrigNextGap = 0;   // próximo trecho mantido e sua lacuna
+let segMoveBaseX = 0;   // clientX de referência do arraste (re-ancorado a cada troca de ordem)
 
 const nextKeptIdx = (idx) => {
   for (let j = idx + 1; j < state.segments.length; j++) if (!state.segments[j].deleted) return j;
+  return -1;
+};
+const prevKeptIdxOf = (idx) => {
+  for (let j = idx - 1; j >= 0; j--) if (!state.segments[j].deleted) return j;
   return -1;
 };
 // lacunas na reprodução: overlay preto + playhead virtual passando pela lacuna
@@ -449,7 +577,22 @@ let gapHold = null;      // reprodução temporizada do preto durante uma lacuna
 let prevKeptIdx = -1;    // último trecho tocado (evita retriggar a mesma lacuna)
 
 const setGapOverlay = (show) => $("gap-overlay").classList.toggle("show", show);
-const keptIdxAt = (t) => state.segments.findIndex(s => !s.deleted && t >= s.start && t <= s.end);
+const keptIdxAt = (src, t) =>
+  state.segments.findIndex(s => !s.deleted && s.src === src && t >= s.start && t <= s.end);
+
+// próximo trecho mantido (em ordem de timeline) depois de `seg`
+function nextKeptAfter(seg) {
+  const i = state.segments.indexOf(seg);
+  for (let j = i + 1; j < state.segments.length; j++)
+    if (!state.segments[j].deleted) return state.segments[j];
+  return null;
+}
+// posiciona o player em (src, t): busca no mesmo arquivo, ou troca o <video>
+// quando o alvo está num arquivo diferente do carregado.
+function seekSource(src, t) {
+  if (src && src !== activeSrc) switchPlayerTo(src, t);
+  else seekTo(t);
+}
 
 // raspagem ciente de lacuna: se o ponteiro cai numa lacuna, mostra preto e
 // estaciona o vídeo no início do próximo trecho (frame atrás do overlay).
@@ -457,9 +600,9 @@ function scrubToVisible(vt) {
   const inGap = visibleGapAt(vt);
   gapVisible = inGap ? vt : null;
   setGapOverlay(inGap);
-  const src = visibleToSource(vt);
-  prevKeptIdx = keptIdxAt(src);
-  seekTo(src);
+  const { src, t } = visibleToSource(vt);
+  prevKeptIdx = keptIdxAt(src, t);
+  seekSource(src, t);
 }
 function startGapHold(seg) {
   player.pause();
@@ -493,13 +636,14 @@ function segIndexAtVisible(vt) {
   }
   return -1;
 }
-function selectSegAt(t) {
-  const i = state.segments.findIndex(s => !s.deleted && t >= s.start && t <= s.end);
+function selectSegAt(src, t) {
+  const i = state.segments.findIndex(s => !s.deleted && s.src === src && t >= s.start && t <= s.end);
   selectedSeg = i >= 0 ? i : null;
 }
 function seekAndSelect(e) {
   const vt = visibleAtEvent(e);
-  selectSegAt(visibleToSource(vt));   // clicar seleciona o trecho sob o ponteiro
+  const { src, t } = visibleToSource(vt);
+  selectSegAt(src, t);                 // clicar seleciona o trecho sob o ponteiro
   scrubToVisible(vt);
   renderState();
 }
@@ -516,15 +660,17 @@ player.addEventListener("seeked", () => {
 const onRuler = (e) => (e.clientY - canvas.getBoundingClientRect().top) < RULER_CSS_H;
 
 canvas.addEventListener("pointerdown", (e) => {
-  if (!videoDur() || animDur <= 0) return;
+  if (!hasContent() || animDur <= 0) return;
   canvas.setPointerCapture(e.pointerId);
   downX = e.clientX;
   dragMoved = false;
   const overIdx = onRuler(e) ? -1 : segIndexAtVisible(visibleAtEvent(e));
   if (overIdx !== -1 && overIdx === selectedSeg) {
-    // arrastar o segmento SELECIONADO → afasta criando/ajustando a lacuna
+    // arrastar o segmento SELECIONADO → desliza na lacuna preta e, ao passar
+    // por cima de um vizinho, troca de ordem com ele (reordenação)
     segMoving = true;
     segMoveIdx = overIdx;
+    segMoveBaseX = e.clientX;
     segMoveOrigGap = state.segments[overIdx].gap || 0;
     segMoveNextIdx = nextKeptIdx(overIdx);          // trecho seguinte (não se move)
     segMoveOrigNextGap = segMoveNextIdx !== -1 ? (state.segments[segMoveNextIdx].gap || 0) : 0;
@@ -560,11 +706,37 @@ canvas.addEventListener("pointermove", (e) => {
       segMoveHist = true;
     }
     const rect = canvas.getBoundingClientRect();
-    const dxSec = (e.clientX - downX) / rect.width * segMoveSpan0;
-    // move SÓ este trecho: consome a lacuna de um lado e devolve do outro, sem
-    // mexer nos vizinhos. Limitado pelo espaço preto disponível de cada lado:
-    //  à esquerda até encostar no anterior (−lacuna deste), à direita até o
-    //  seguinte (+lacuna do seguinte); o último trecho pode ir livre p/ a direita.
+    // 1) REORDENAR: se o arraste passar do meio de um vizinho, troca de posição
+    //    com ele no array. Re-ancora a referência do arraste (segMoveBaseX) para
+    //    o gesto continuar contínuo e poder cruzar vários trechos em sequência.
+    const rebase = () => {
+      segMoveBaseX = e.clientX;
+      segMoveOrigGap = state.segments[segMoveIdx].gap || 0;
+      segMoveNextIdx = nextKeptIdx(segMoveIdx);
+      segMoveOrigNextGap = segMoveNextIdx !== -1 ? (state.segments[segMoveNextIdx].gap || 0) : 0;
+      selectedSeg = segMoveIdx;
+    };
+    const dxr = (e.clientX - segMoveBaseX) / rect.width * segMoveSpan0;
+    const ni = nextKeptIdx(segMoveIdx), pi = prevKeptIdxOf(segMoveIdx);
+    if (dxr > 0 && ni !== -1 &&
+        dxr - segMoveOrigNextGap >= (state.segments[ni].end - state.segments[ni].start) / 2) {
+      const seg = state.segments.splice(segMoveIdx, 1)[0];  // dragado passa p/ depois do próximo
+      state.segments.splice(ni, 0, seg);
+      segMoveIdx = ni;
+      const f = state.segments.find(s => !s.deleted); if (f) f.gap = 0; // sem preto solto no início
+      rebase();
+    } else if (dxr < 0 && pi !== -1 &&
+        -dxr - segMoveOrigGap >= (state.segments[pi].end - state.segments[pi].start) / 2) {
+      const seg = state.segments.splice(segMoveIdx, 1)[0];  // dragado passa p/ antes do anterior
+      state.segments.splice(pi, 0, seg);
+      segMoveIdx = pi;
+      const f = state.segments.find(s => !s.deleted); if (f) f.gap = 0;
+      rebase();
+    }
+    // 2) DESLIZAR na lacuna: dentro do espaço preto ajusta o gap (comportamento
+    //    original). Consome a lacuna de um lado e devolve do outro, sem mexer nos
+    //    vizinhos; limitado pelo preto disponível (o último trecho vai livre p/ direita).
+    const dxSec = (e.clientX - segMoveBaseX) / rect.width * segMoveSpan0;
     let d = Math.max(dxSec, -segMoveOrigGap);
     if (segMoveNextIdx !== -1) d = Math.min(d, segMoveOrigNextGap);
     state.segments[segMoveIdx].gap = segMoveOrigGap + d;
@@ -605,7 +777,7 @@ canvas.addEventListener("pointerup", (e) => {
 
 // roda do mouse amplia/reduz mantendo o ponto sob o cursor fixo
 canvas.addEventListener("wheel", (e) => {
-  if (!videoDur() || animDur <= 0) return;
+  if (!hasContent() || animDur <= 0) return;
   e.preventDefault();
   const rect = canvas.getBoundingClientRect();
   const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
@@ -621,28 +793,58 @@ canvas.addEventListener("dblclick", () => { tlZoom = 1; tlView = 0; drawTimeline
 
 new ResizeObserver(drawTimeline).observe(canvas);
 
+// arrastar um arquivo da lista para a faixa da timeline abre-o para edição
+const dropZone = $("bottom");
+dropZone.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "copy";
+  canvas.classList.add("drag-over");
+});
+dropZone.addEventListener("dragleave", (e) => {
+  if (!dropZone.contains(e.relatedTarget)) canvas.classList.remove("drag-over");
+});
+dropZone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  canvas.classList.remove("drag-over");
+  const path = e.dataTransfer.getData("text/plain");
+  if (!path) return;
+  path.toLowerCase().endsWith(".evp") ? loadProject(path) : addToTimeline(path);
+});
+
 // Durante a reprodução: pula os trechos deletados e, ao entrar num trecho que
 // foi afastado, toca a lacuna como preto+silêncio pela sua duração.
 function advancePlayback() {
   if (scrubbing || segMoving || gapHold || !state.segments.length || player.paused) return;
   const t = player.currentTime;
-  // 1) região deletada → salta para o próximo trecho mantido
-  const del = state.segments.find(s => s.deleted && t >= s.start && t < s.end);
+  // 1) região deletada do arquivo ativo → salta para o próximo trecho mantido
+  const del = state.segments.find(s => s.deleted && s.src === activeSrc && t >= s.start && t < s.end);
   if (del) {
-    const nxt = state.segments.find(s => !s.deleted && s.start >= del.end - 0.001);
-    if (nxt) {
-      prevKeptIdx = state.segments.indexOf(nxt);
-      player.currentTime = nxt.start + 0.001;
-      if ((nxt.gap || 0) > 0.02) startGapHold(nxt);
-    } else { player.pause(); player.currentTime = del.start; }
+    const nxt = nextKeptAfter(del);
+    if (nxt) goToKept(nxt);
+    else { player.pause(); player.currentTime = del.start; }
     return;
   }
-  // 2) entrou num novo trecho mantido → se tem lacuna antes, toca o preto
-  const idx = keptIdxAt(t);
-  if (idx !== -1 && idx !== prevKeptIdx) {
+  // 2) dentro de um trecho mantido do arquivo ativo
+  const idx = keptIdxAt(activeSrc, t);
+  if (idx === -1) return;
+  if (idx !== prevKeptIdx) {            // entrou num novo trecho → toca a lacuna anterior
     prevKeptIdx = idx;
     if ((state.segments[idx].gap || 0) > 0.02) startGapHold(state.segments[idx]);
   }
+  // ao fim deste trecho, se o próximo é de OUTRO arquivo, pula para ele (senão o
+  // <video> continuaria tocando o resto do arquivo ativo além do trecho).
+  const seg = state.segments[idx];
+  if (t >= seg.end - 0.05) {
+    const nxt = nextKeptAfter(seg);
+    if (nxt && nxt.src !== activeSrc) goToKept(nxt);
+  }
+}
+
+// salta a reprodução para o início de um trecho mantido (troca de arquivo se preciso)
+function goToKept(seg) {
+  prevKeptIdx = state.segments.indexOf(seg);
+  seekSource(seg.src, seg.start + 0.001);
+  if ((seg.gap || 0) > 0.02) startGapHold(seg);
 }
 
 // timeupdate dispara a cada quadro durante a reprodução.
@@ -651,7 +853,7 @@ player.addEventListener("timeupdate", () => {
   if (gapHold == null) drawTimeline();   // durante a lacuna quem desenha é o gapHoldStep
 });
 player.addEventListener("play", () => {
-  prevKeptIdx = keptIdxAt(player.currentTime);
+  prevKeptIdx = keptIdxAt(activeSrc, player.currentTime);
   advancePlayback();
 });
 player.addEventListener("pause", () => {
@@ -661,15 +863,16 @@ player.addEventListener("pause", () => {
 
 // ---------- corte / deleção / exportação ----------
 function doCut() {
-  const t = player.currentTime;
-  const i = state.segments.findIndex(s => t > s.start + CUT_EPS && t < s.end - CUT_EPS);
-  if (i < 0) return; // em cima de uma borda ou fora do vídeo
+  const t = player.currentTime;   // o playhead está sempre dentro do arquivo ativo
+  const i = state.segments.findIndex(s =>
+    s.src === activeSrc && !s.deleted && t > s.start + CUT_EPS && t < s.end - CUT_EPS);
+  if (i < 0) return; // em cima de uma borda ou fora do trecho
   selectedSeg = null;
   apply(s => {
     const seg = s.segments[i];
     s.segments.splice(i, 1,
-      { start: seg.start, end: t, deleted: seg.deleted, speed: seg.speed, gap: seg.gap || 0 },
-      { start: t, end: seg.end, deleted: seg.deleted, speed: seg.speed, gap: 0 });
+      { src: seg.src, start: seg.start, end: t, deleted: seg.deleted, speed: seg.speed, gap: seg.gap || 0, hue: seg.hue },
+      { src: seg.src, start: t, end: seg.end, deleted: seg.deleted, speed: seg.speed, gap: 0, hue: nextHue() });
   });
 }
 function deleteSelected() {
@@ -691,8 +894,8 @@ $("btn-del-seg").onclick = deleteSelected;
 $("seg-speed").onchange = setSpeedSelected;
 // Detecta o formato do arquivo original
 function getOriginalFormat() {
-  if (!currentPath) return "";
-  const ext = currentPath.split(".").pop().toLowerCase();
+  if (!activeSrc) return "";
+  const ext = activeSrc.split(".").pop().toLowerCase();
   return ext === "webm" ? "webm" : ext === "mkv" ? "mkv" : "mp4";
 }
 
@@ -704,23 +907,90 @@ $("btn-export").onclick = () => {
   setExportOptsVisible(true);
   $("export-format").value = getOriginalFormat() ? "" : "mp4";
 };
+// salvar PROJETO (.evp): grava os segmentos da timeline em JSON para retomar depois
+$("btn-save").onclick = async () => {
+  if (!state.segments.length) return;
+  try {
+    const picked = await api("/api/pick-save?input=" + encodeURIComponent(state.segments[0].src) +
+      "&suffix=projeto&ext=evp&title=" + encodeURIComponent("Salvar projeto"));
+    if (picked.cancelled) return;
+    const project = { app: "EditorVideo", version: 1, savedAt: new Date().toISOString(),
+                      segments: state.segments };
+    const r = await api("/api/project-save", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: picked.path, project }),
+    });
+    $("file-info").textContent = "✔ Projeto salvo em " + r.path;
+    if (r.path.slice(0, r.path.lastIndexOf("/")) === browseDir) browse(browseDir);
+  } catch (e) { alert("Erro ao salvar projeto: " + e.message); }
+};
+
+// abrir projeto pelo seletor de arquivos (zenity filtrado em .evp)
+$("btn-open").onclick = async () => {
+  try {
+    const picked = await api("/api/pick-open?title=" + encodeURIComponent("Abrir projeto") +
+      "&filter=" + encodeURIComponent("Projetos EditorVideo (*.evp) | *.evp"));
+    if (picked.cancelled) return;
+    loadProject(picked.path);
+  } catch (e) { alert("Erro ao abrir projeto: " + e.message); }
+};
+
+// retomar um projeto .evp: restaura os segmentos (substitui a timeline atual)
+async function loadProject(path) {
+  if (hasContent() &&
+      !confirm("Carregar o projeto substitui a timeline atual. Continuar?")) return;
+  let proj;
+  try {
+    proj = await api("/api/project-load?path=" + encodeURIComponent(path));
+  } catch (e) { alert("Erro ao abrir projeto: " + e.message); return; }
+  const segs = proj.segments || [];
+  if (!segs.length) { alert("Projeto vazio."); return; }
+  const missing = [];
+  for (const src of [...new Set(segs.map(s => s.src))]) {
+    if (!await ensureSource(src)) missing.push(src);
+  }
+  if (missing.length) {
+    alert("Arquivos do projeto não encontrados:\n" + missing.join("\n"));
+    return;
+  }
+  apply(st => { st.segments = segs; });   // entra no histórico (dá para desfazer)
+  selectedSeg = null;
+  tlZoom = 1; tlView = 0;
+  const first = segs.find(s => !s.deleted) || segs[0];
+  $("player-wrap").classList.add("has-video");
+  switchPlayerTo(first.src, first.start);
+  updateActiveUI();
+  drawTimeline();
+}
 $("btn-export-cancel").onclick = () => setExportOptsVisible(false);
 $("btn-export-go").onclick = async () => {
   const kept = state.segments.filter(s => !s.deleted);
-  const format = $("export-format").value; // "" = manter original, ou "mp4"/"mkv"
-  const op = format ? "render_convert" : "render";
-  const ext = format || currentPath.split(".").pop();
+  if (!kept.length) return;
+  const srcs = [...new Set(kept.map(s => s.src))];
+  const multi = srcs.length > 1;
+  const format = $("export-format").value; // "" = manter original, ou "mp4"
+  // multi-arquivo sempre recodifica/normaliza (formatos podem diferir) → mp4 por padrão
+  const ext = multi ? (format || "mp4") : (format || activeSrc.split(".").pop());
   const btn = $("btn-export-go");
   btn.disabled = true;
   try {
-    const picked = await api("/api/pick-save?input=" + encodeURIComponent(currentPath) +
+    const picked = await api("/api/pick-save?input=" + encodeURIComponent(kept[0].src) +
       "&suffix=editado&ext=" + encodeURIComponent(ext));
     if (picked.cancelled) return; // usuário cancelou no seletor, painel continua aberto
-    const body = {
-      op, input: currentPath, output: picked.path,
-      parts: kept.map(s => [s.start, s.end, s.speed || 1, s.gap || 0]),
-    };
-    if (format) body.format = format;
+    let body;
+    if (multi) {
+      body = {
+        op: "render_multi", output: picked.path, format: format || "mp4",
+        parts: kept.map(s => [s.src, s.start, s.end, s.speed || 1, s.gap || 0]),
+      };
+    } else {
+      body = {
+        op: format ? "render_convert" : "render",
+        input: kept[0].src, output: picked.path,
+        parts: kept.map(s => [s.start, s.end, s.speed || 1, s.gap || 0]),
+      };
+      if (format) body.format = format;
+    }
     submitJob(body);
     setExportOptsVisible(false);
   } catch (e) {
@@ -736,7 +1006,7 @@ document.addEventListener("keydown", (e) => {
   else if (e.ctrlKey && (e.key === "y" || (e.shiftKey && e.key === "Z"))) { e.preventDefault(); redo(); }
   else if (e.key === "c" && !e.ctrlKey && !$("btn-cut").disabled) doCut();
   else if (e.key === "Delete") deleteSelected();
-  else if (e.key === " " && currentPath && e.target.tagName !== "BUTTON") {
+  else if (e.key === " " && activeSrc && e.target.tagName !== "BUTTON") {
     e.preventDefault();
     player.paused ? player.play() : player.pause();
   }
@@ -746,40 +1016,26 @@ document.addEventListener("keydown", (e) => {
 function renderState() {
   if (selectedSeg != null && selectedSeg >= state.segments.length) selectedSeg = null;
 
-  // fila de junção
-  const jl = $("join-list");
-  jl.innerHTML = "";
-  state.joinQueue.forEach((p, i) => {
-    const li = document.createElement("li");
-    li.innerHTML = `<span class="grow" title="${p}">${i + 1}. ${basename(p)}</span>` +
-      `<button class="mv" title="Subir">▲</button><button class="mv" title="Descer">▼</button>` +
-      `<button class="rm" title="Remover">✕</button>`;
-    const [up, down, rm] = li.querySelectorAll("button");
-    up.onclick = () => i > 0 && apply(st =>
-      st.joinQueue.splice(i - 1, 0, st.joinQueue.splice(i, 1)[0]));
-    down.onclick = () => i < state.joinQueue.length - 1 && apply(st =>
-      st.joinQueue.splice(i + 1, 0, st.joinQueue.splice(i, 1)[0]));
-    rm.onclick = () => apply(st => st.joinQueue.splice(i, 1));
-    jl.appendChild(li);
-  });
-  $("btn-join").disabled = state.joinQueue.length < 2;
-
   // botões da timeline
   const segs = state.segments;
   const kept = segs.filter(s => !s.deleted).length;
   const del = segs.length - kept;
   const sped = segs.some(s => !s.deleted && s.speed && s.speed !== 1);
   const gapped = segs.some(s => !s.deleted && (s.gap || 0) > 1e-6);
+  const nFiles = distinctSrcs().length;   // arquivos distintos na timeline
   $("btn-cut").disabled = !segs.length;
   $("btn-del-seg").disabled = selectedSeg == null || segs[selectedSeg]?.deleted;
   const segEditable = selectedSeg != null && !segs[selectedSeg]?.deleted;
   $("seg-speed").disabled = !segEditable;
   $("seg-speed").value = segEditable ? String(segs[selectedSeg].speed || 1) : "1";
-  $("btn-export").disabled = !(kept > 0 && (del > 0 || sped || gapped));
-  $("mark-info").textContent = segs.length > 1
-    ? `${segs.length} segmentos` + (del ? ` · ${del} deletado${del > 1 ? "s" : ""}` : "")
-      + (gapped ? " · com lacuna" : "")
-    : (gapped ? "com lacuna" : "");
+  // multi-arquivo já é motivo para exportar (junta os arquivos), além de cortes/velocidade/lacuna
+  $("btn-export").disabled = !(kept > 0 && (del > 0 || sped || gapped || nFiles > 1));
+  $("btn-save").disabled = !segs.length;   // salvar projeto: basta ter timeline
+  $("mark-info").textContent = (nFiles > 1 ? `${nFiles} arquivos · ` : "")
+    + (segs.length > 1
+      ? `${segs.length} segmentos` + (del ? ` · ${del} deletado${del > 1 ? "s" : ""}` : "")
+        + (gapped ? " · com lacuna" : "")
+      : (gapped ? "com lacuna" : ""));
 
   $("btn-undo").disabled = !history.past.length;
   $("btn-redo").disabled = !history.future.length;
@@ -813,25 +1069,33 @@ function startPolling() {
 }
 
 const OP_LABEL = {
-  cut: "Corte", join: "Junção", convert: "Conversão",
+  cut: "Corte", convert: "Conversão",
   extract: "Áudio", delete: "Remoção", render: "Exportação", render_convert: "Exportação",
-  preview: "Pré-visualização",
+  render_multi: "Exportação", preview: "Pré-visualização",
 };
 
 async function refreshJobs() {
   const jobs = await api("/api/jobs");
   const bar = $("jobs-bar");
   const all = Object.values(jobs);
-  const running = all.filter(j => j.status === "running");
+  const running = Object.entries(jobs).filter(([, j]) => j.status === "running");
   bar.innerHTML = "";
 
-  // tarefas em andamento: rótulo + barra + %
-  for (const j of running) {
+  // tarefas em andamento: rótulo + barra + % (+ Stop nas conversões)
+  for (const [jid, j] of running) {
     const chip = document.createElement("div");
     chip.className = "job-chip";
     chip.innerHTML = `<span>${OP_LABEL[j.op] || j.op}</span>` +
       `<div class="bar"><div style="width:${j.progress}%"></div></div>` +
       `<span>${Math.round(j.progress)}%</span>`;
+    if (j.op === "convert") {
+      const stop = document.createElement("button");
+      stop.className = "stop";
+      stop.textContent = "Stop";
+      stop.title = "Cancelar a conversão";
+      stop.onclick = () => api("/api/cancel?job=" + jid);
+      chip.insertBefore(stop, chip.querySelector(".bar"));   // à esquerda da barra
+    }
     bar.appendChild(chip);
   }
 
@@ -845,6 +1109,8 @@ async function refreshJobs() {
     if (j.status === "done") {
       chip.title = j.output;
       chip.innerHTML = `<span class="job-ok">✔ ${OP_LABEL[j.op] || j.op}: ${basename(j.output)}</span>`;
+    } else if (j.status === "cancelled") {
+      chip.innerHTML = `<span class="job-cancel">■ ${OP_LABEL[j.op] || j.op} cancelada</span>`;
     } else {
       chip.title = j.error || "";
       chip.innerHTML = `<span class="job-err">✖ ${OP_LABEL[j.op] || j.op} falhou</span>`;
@@ -856,24 +1122,23 @@ async function refreshJobs() {
 }
 
 // ---------- botões de operação ----------
-$("btn-join").onclick = () => submitJob({ op: "join", inputs: state.joinQueue });
 $("btn-convert").onclick = async () => {
   const jobId = await submitJob({
-    op: "convert", input: currentPath,
+    op: "convert", input: activeSrc,
     format: $("conv-format").value,
     quality: $("conv-quality").value,
     gpu: $("conv-gpu").checked,
   });
   if (!jobId) return;
   try {
-    // ao terminar, já abre o arquivo convertido pronto para edição
+    // ao terminar, soma o arquivo convertido à timeline pronto para edição
     const job = await pollJob(jobId, 800);
     const dir = job.output.slice(0, job.output.lastIndexOf("/"));
     if (dir === browseDir) await browse(browseDir); // revela o novo arquivo na lista
-    loadVideo(job.output);
-  } catch (_) { /* falha já sinalizada na barra de tarefas */ }
+    addToTimeline(job.output);
+  } catch (_) { /* falha/cancelamento já sinalizados na barra de tarefas */ }
 };
-$("btn-extract").onclick = () => submitJob({ op: "extract", input: currentPath });
+$("btn-extract").onclick = () => submitJob({ op: "extract", input: activeSrc });
 
 // WebM/VP9 não tem aceleração de GPU nesta ferramenta (NVENC não codifica VP9)
 let gpuCheckedBeforeWebm = true;

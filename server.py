@@ -21,6 +21,7 @@ HOME = os.path.expanduser("~")
 START_DIR = os.path.join(HOME, "Vídeos") if os.path.isdir(os.path.join(HOME, "Vídeos")) else HOME
 
 VIDEO_EXTS = {".mp4", ".mkv", ".m4v", ".mov", ".avi", ".webm", ".ts", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp"}
+PROJECT_EXT = ".evp"   # projeto do EditorVideo (JSON com os segmentos da timeline)
 AUDIO_COPY = {"aac": ".m4a", "mp3": ".mp3", "opus": ".opus", "flac": ".flac", "vorbis": ".ogg"}
 
 # formatos que o <video> do navegador reproduz nativamente; os demais (mkv,
@@ -28,6 +29,8 @@ AUDIO_COPY = {"aac": ".m4a", "mp3": ".mp3", "opus": ".opus", "flac": ".flac", "v
 DIRECT_PLAYABLE_EXTS = {".mp4", ".m4v", ".mov", ".webm"}
 PREVIEW_CACHE_DIR = os.path.join(HOME, ".cache", "editorvideo", "previews")
 os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
+THUMB_CACHE_DIR = os.path.join(HOME, ".cache", "editorvideo", "thumbs")
+os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
 FFMPEG = shutil.which("ffmpeg") or os.path.join(HOME, ".local/bin/ffmpeg")
 FFPROBE = shutil.which("ffprobe") or os.path.join(HOME, ".local/bin/ffprobe")
@@ -35,6 +38,7 @@ FFPROBE = shutil.which("ffprobe") or os.path.join(HOME, ".local/bin/ffprobe")
 # jobs[id] = {status, progress, output, error, op}
 jobs = {}
 jobs_lock = threading.Lock()
+procs = {}   # job_id -> Popen do ffmpeg em execução (para cancelamento)
 
 
 def has_nvenc():
@@ -97,11 +101,60 @@ def needs_preview(path):
     return os.path.splitext(path)[1].lower() not in DIRECT_PLAYABLE_EXTS
 
 
-def preview_cache_path(src):
-    """Caminho de cache determinístico por conteúdo (invalida se o arquivo mudar)."""
+def cache_key(src):
+    """Chave de cache determinística por conteúdo (invalida se o arquivo mudar)."""
     st = os.stat(src)
-    key = hashlib.sha1(f"{src}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()
-    return os.path.join(PREVIEW_CACHE_DIR, key + ".mp4")
+    return hashlib.sha1(f"{src}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()
+
+
+def preview_cache_path(src):
+    return os.path.join(PREVIEW_CACHE_DIR, cache_key(src) + ".mp4")
+
+
+_meta_cache = {}
+_meta_lock = threading.Lock()
+
+
+def quick_duration(src):
+    """Duração em segundos lendo só o header (ffprobe rápido), com cache em memória."""
+    key = cache_key(src)
+    with _meta_lock:
+        if key in _meta_cache:
+            return _meta_cache[key]
+    r = subprocess.run(
+        [FFPROBE, "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", src],
+        capture_output=True, text=True, timeout=20)
+    try:
+        dur = float(r.stdout.strip())
+    except ValueError:
+        dur = 0.0
+    with _meta_lock:
+        _meta_cache[key] = dur
+    return dur
+
+
+THUMB_SEM = threading.Semaphore(3)   # limita ffmpegs simultâneos gerando miniaturas
+
+
+def make_thumb(src):
+    """Extrai 1 frame do vídeo como miniatura jpg, com cache em disco."""
+    out = os.path.join(THUMB_CACHE_DIR, cache_key(src) + ".jpg")
+    if os.path.exists(out):
+        return out
+    dur = quick_duration(src)
+    # frame a 10% da duração (máx. 5 s): pula telas pretas de abertura sem
+    # decodificar demais em arquivos com poucos keyframes (gravações de tela)
+    t = min(dur * 0.1, 5.0) if dur > 0 else 0.0
+    with THUMB_SEM:
+        for ss in ([t, 0.0] if t > 0 else [0.0]):
+            r = subprocess.run(
+                [FFMPEG, "-nostdin", "-y", "-ss", f"{ss:.3f}", "-i", src,
+                 "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "4", out],
+                capture_output=True, text=True, timeout=60)
+            if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+                return out
+    raise RuntimeError("falha ao gerar miniatura")
 
 
 def build_preview_cmd(src, out, info):
@@ -335,6 +388,8 @@ def run_job(job_id, cmd, total_duration, output, cleanup=None):
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
+        with jobs_lock:
+            procs[job_id] = proc
         stderr_tail = []
 
         def read_err():
@@ -358,7 +413,11 @@ def run_job(job_id, cmd, total_duration, output, cleanup=None):
         proc.wait()
         t.join(timeout=5)
         with jobs_lock:
-            if proc.returncode == 0:
+            if jobs[job_id].get("cancelled"):
+                jobs[job_id].update(status="cancelled")
+                if os.path.exists(output):
+                    os.remove(output)     # descarta a saída parcial
+            elif proc.returncode == 0:
                 jobs[job_id].update(status="done", progress=100, output=output)
             else:
                 jobs[job_id].update(status="error",
@@ -369,6 +428,8 @@ def run_job(job_id, cmd, total_duration, output, cleanup=None):
         with jobs_lock:
             jobs[job_id].update(status="error", error=str(e))
     finally:
+        with jobs_lock:
+            procs.pop(job_id, None)
         paths = cleanup if isinstance(cleanup, list) else ([cleanup] if cleanup else [])
         for c in paths:
             if c and os.path.exists(c):
@@ -568,9 +629,113 @@ def op_render_convert(p):
     return start_job("render_convert", cmd, total, out, cleanup=tmp_files)
 
 
+def op_render_multi(p):
+    """Exporta uma timeline que mistura VÁRIOS arquivos-fonte.
+
+    Como os arquivos podem ter codec/resolução/fps/áudio diferentes, o -c copy do
+    concat demuxer não serve. Aqui cada trecho é normalizado (escala+pad para um
+    tamanho comum, fps e samplerate fixos, aceleração aplicada) e todos são unidos
+    pelo filtro concat, recodificando uma única vez. As lacunas viram trechos de
+    preto+silêncio já no tamanho-alvo.
+
+    parts = [[src, start, end, speed, gap], ...]
+    """
+    parts = [(safe_path(x[0]), float(x[1]), float(x[2]), float(x[3]),
+              float(x[4]) if len(x) > 4 else 0.0) for x in p["parts"]]
+    if not parts:
+        raise ValueError("nenhum segmento para exportar")
+    fmt = p.get("format") or "mp4"
+    infos = {}
+    for src, *_ in parts:
+        if src not in infos:
+            infos[src] = probe(src)
+    # tamanho-alvo: primeiro vídeo disponível define WxH; fps/samplerate fixos
+    W = H = None
+    for src, *_ in parts:
+        v = infos[src]["video"]
+        if v and v.get("width") and v.get("height"):
+            W, H = int(v["width"]), int(v["height"])
+            break
+    if not W:
+        W, H = 1920, 1080
+    W -= W % 2   # dimensões pares: yuv420p exige, e evita o scale arredondar 1px
+    H -= H % 2   # para cima e estourar o pad ("padded dims smaller than input")
+    FPS, SR = 30, 48000
+
+    inputs, vfilters, afilters, labels = [], [], [], []
+    idx = 0
+
+    def add_black(gap):
+        nonlocal idx
+        inputs.extend(["-f", "lavfi", "-t", f"{gap:.4f}",
+                       "-i", f"color=c=black:s={W}x{H}:r={FPS}"])
+        vi = idx
+        idx += 1
+        inputs.extend(["-f", "lavfi", "-t", f"{gap:.4f}",
+                       "-i", f"anullsrc=r={SR}:cl=stereo"])
+        ai = idx
+        idx += 1
+        vfilters.append(f"[{vi}:v]setsar=1,format=yuv420p[v{vi}]")
+        afilters.append(f"[{ai}:a]aformat=sample_fmts=fltp:channel_layouts=stereo[a{ai}]")
+        labels.append((f"v{vi}", f"a{ai}"))
+
+    def add_clip(src, s, e, sp):
+        nonlocal idx
+        # trim por -ss/-to na entrada (rápido); depois normaliza no grafo
+        inputs.extend(["-ss", f"{s}", "-to", f"{e}", "-i", src])
+        vi = idx
+        idx += 1
+        vfilters.append(
+            f"[{vi}:v]setpts=PTS/{sp:.6f},"
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps={FPS},setsar=1,format=yuv420p[v{vi}]")
+        if infos[src]["audio"]:
+            afilters.append(
+                f"[{vi}:a]{atempo_chain(sp)},aresample={SR},"
+                f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{vi}]")
+            labels.append((f"v{vi}", f"a{vi}"))
+        else:  # arquivo sem áudio: gera silêncio da mesma duração para o concat casar
+            dur = (e - s) / sp
+            inputs.extend(["-f", "lavfi", "-t", f"{dur:.4f}",
+                           "-i", f"anullsrc=r={SR}:cl=stereo"])
+            ai = idx
+            idx += 1
+            afilters.append(f"[{ai}:a]aformat=sample_fmts=fltp:channel_layouts=stereo[a{ai}]")
+            labels.append((f"v{vi}", f"a{ai}"))
+
+    for src, s, e, sp, gap in parts:
+        if gap > 0.001:
+            add_black(gap)
+        add_clip(src, s, e, sp)
+
+    n = len(labels)
+    concat_in = "".join(f"[{v}][{a}]" for v, a in labels)
+    graph = ";".join(vfilters + afilters +
+                     [f"{concat_in}concat=n={n}:v=1:a=1[vout][aout]"])
+
+    d = os.path.dirname(parts[0][0])
+    base = os.path.splitext(os.path.basename(parts[0][0]))[0]
+    out = safe_path(p["output"]) if p.get("output") else unique_output(d, base, "editado", "." + fmt)
+
+    if fmt == "webm":
+        venc = ["-c:v", "libvpx-vp9", "-crf", "31", "-b:v", "0", "-row-mt", "1", "-cpu-used", "2"]
+        aenc = ["-c:a", "libopus", "-b:a", "128k"]
+        tail = []
+    else:
+        venc = (["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "23", "-b:v", "0"]
+                if NVENC else ["-c:v", "libx264", "-preset", "medium", "-crf", "23"])
+        aenc = ["-c:a", "aac", "-b:a", "160k"]
+        tail = ["-movflags", "+faststart"]
+
+    total = sum((e - s) / sp + gap for _, s, e, sp, gap in parts)
+    cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats"] + inputs + \
+        ["-filter_complex", graph, "-map", "[vout]", "-map", "[aout]"] + venc + aenc + tail + [out]
+    return start_job("render_multi", cmd, total, out)
+
+
 OPS = {"cut": op_cut, "join": op_join, "convert": op_convert,
        "extract": op_extract_audio, "delete": op_delete, "render": op_render,
-       "render_convert": op_render_convert}
+       "render_convert": op_render_convert, "render_multi": op_render_multi}
 
 
 # ---------- HTTP ----------
@@ -655,7 +820,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/":
             return self._static("index.html")
-        if route.startswith("/js/") or route.startswith("/css/"):
+        if route.startswith("/js/") or route.startswith("/css/") or route.startswith("/icons/"):
             return self._static(route)
 
         if route == "/api/config":
@@ -673,7 +838,8 @@ class Handler(BaseHTTPRequestHandler):
                     full = os.path.join(d, name)
                     if os.path.isdir(full):
                         entries["dirs"].append(name)
-                    elif os.path.splitext(name)[1].lower() in VIDEO_EXTS:
+                    elif os.path.splitext(name)[1].lower() in VIDEO_EXTS \
+                            or name.lower().endswith(PROJECT_EXT):
                         entries["files"].append(
                             {"name": name, "size": os.path.getsize(full)})
                 return self._json(entries)
@@ -688,6 +854,28 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/api/media":
             return self._media(q.get("path", [""])[0])
+
+        if route == "/api/thumb":
+            try:
+                thumb = make_thumb(safe_path(q["path"][0]))
+                with open(thumb, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            except Exception as e:
+                return self._json({"error": str(e)}, 404)
+
+        if route == "/api/meta":
+            try:
+                return self._json(
+                    {"duration": quick_duration(safe_path(q["path"][0]))})
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
 
         if route == "/api/preview":
             try:
@@ -704,16 +892,33 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"error": str(e)}, 400)
 
+        if route == "/api/pick-open":
+            try:
+                title = q.get("title", ["Abrir arquivo"])[0]
+                pattern = q.get("filter", ["*"])[0]
+                cmd = ["zenity", "--file-selection", f"--title={title}",
+                       f"--filename={START_DIR}/", f"--file-filter={pattern}"]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                if r.returncode != 0:
+                    return self._json({"cancelled": True})
+                return self._json({"path": safe_path(r.stdout.strip())})
+            except FileNotFoundError:
+                return self._json(
+                    {"error": "zenity não encontrado (instale: sudo apt install zenity)"}, 500)
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
         if route == "/api/pick-save":
             try:
                 src = safe_path(q["input"][0])
                 ext = (q.get("ext", [None])[0] or os.path.splitext(src)[1].lstrip(".")).lstrip(".")
                 suffix = q.get("suffix", ["editado"])[0]
+                title = q.get("title", ["Salvar vídeo exportado"])[0]
                 d, name = os.path.dirname(src), os.path.splitext(os.path.basename(src))
                 suggested = unique_output(d, name[0], suffix, "." + ext)
                 r = subprocess.run(
                     ["zenity", "--file-selection", "--save", "--confirm-overwrite",
-                     "--title=Salvar vídeo exportado", f"--filename={suggested}"],
+                     f"--title={title}", f"--filename={suggested}"],
                     capture_output=True, text=True, timeout=600)
                 if r.returncode != 0:
                     return self._json({"cancelled": True})
@@ -725,23 +930,62 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"error": str(e)}, 400)
 
+        if route == "/api/project-load":
+            try:
+                path = safe_path(q["path"][0])
+                with open(path, encoding="utf-8") as f:
+                    proj = json.load(f)
+                if not isinstance(proj.get("segments"), list):
+                    raise ValueError("arquivo de projeto inválido")
+                return self._json(proj)
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
         if route == "/api/jobs":
             with jobs_lock:
                 return self._json(jobs)
 
+        if route == "/api/cancel":
+            job_id = q.get("job", [""])[0]
+            with jobs_lock:
+                j = jobs.get(job_id)
+                if not j or j["status"] != "running":
+                    return self._json({"ok": False})
+                j["cancelled"] = True
+                proc = procs.get(job_id)
+            if proc:
+                proc.terminate()   # run_job percebe, marca "cancelled" e limpa a saída
+            return self._json({"ok": True})
+
         self._json({"error": "rota desconhecida"}, 404)
 
     def do_POST(self):
-        if self.path != "/api/job":
-            return self._json({"error": "rota desconhecida"}, 404)
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
-            op = body["op"]
-            job_id = OPS[op](body)
-            return self._json({"job": job_id})
         except Exception as e:
             return self._json({"error": str(e)}, 400)
+
+        if self.path == "/api/project-save":
+            try:
+                path = safe_path(body["path"])
+                if not path.lower().endswith(PROJECT_EXT):
+                    path += PROJECT_EXT
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(body["project"], f, ensure_ascii=False, indent=1)
+                return self._json({"path": path})
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
+        if self.path == "/api/job":
+            try:
+                op = body["op"]
+                job_id = OPS[op](body)
+                return self._json({"job": job_id})
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
+        return self._json({"error": "rota desconhecida"}, 404)
 
 
 def main():

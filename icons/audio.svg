@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="80"
+   height="80"
+   viewBox="0 0 80 80"
+   version="1.1"
+   id="svg1"
+   sodipodi:docname="audio.svg"
+   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs1" />
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#8d8d8d"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="6.5053824"
+     inkscape:cx="40.58178"
+     inkscape:cy="43.34872"
+     inkscape:window-width="1920"
+     inkscape:window-height="944"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg1" />
+  <g
+     id="g2"
+     transform="matrix(1.1408474,0,0,1.1408474,-5.6338401,-5.6338449)">
+    <g
+       fill="none"
+       stroke="#ffffff"
+       stroke-width="2.3"
+       stroke-linecap="round"
+       stroke-linejoin="round"
+       id="g1"
+       transform="scale(3.3333)">
+      <!-- nota musical (áudio) -->
+      <path
+         d="M 9,18 V 5 L 21,3 v 13"
+         id="path1" />
+      <circle
+         cx="6"
+         cy="18"
+         r="3"
+         id="circle1" />
+      <circle
+         cx="18"
+         cy="16"
+         r="3"
+         id="circle2" />
+    </g>
+  </g>
+</svg>
