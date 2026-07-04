@@ -29,6 +29,7 @@
   </header>
   <div id="player-wrap">
     <video id="player" controls></video>
+    <video id="player2" controls class="standby"></video>
     <div id="gap-overlay"></div>
     <div id="player-empty">Arraste um vídeo da lista para a timeline abaixo</div>
   </div>
@@ -70,6 +71,7 @@
         <select id="export-format">
           <option value="">Manter original</option>
           <option value="mp4">MP4 (recodifica)</option>
+          <option value="webm">WebM (recodifica)</option>
         </select>
       </label>
       <button id="btn-export-go" class="primary"><img src="/icons/save.svg" alt="">Exportar</button>

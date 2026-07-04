@@ -171,7 +171,63 @@ async function browse(dir) {
 }
 
 // ---------- player ----------
-const player = $("player");
+// DOIS elementos <video> alternados: enquanto um toca, o outro (reserva,
+// .standby) pré-carrega o próximo arquivo da timeline; na fronteira eles
+// trocam de papel na hora — sem recarregar src, sem flash.
+let player = $("player");        // elemento ATIVO (visível)
+let backPlayer = $("player2");   // reserva escondido com o próximo arquivo
+let backWant = null;             // instante a posicionar no reserva após carregar
+
+// listeners do player ativo: registrados aqui para MIGRAREM junto na troca
+const playerEvents = [];
+function onPlayerEvent(ev, fn) {
+  playerEvents.push([ev, fn]);
+  player.addEventListener(ev, fn);
+}
+
+// o reserva se posiciona no ponto de entrada assim que os metadados chegam
+for (const el of [player, backPlayer]) {
+  el.addEventListener("loadedmetadata", () => {
+    if (el === player || backWant == null) return;
+    try { el.currentTime = backWant; } catch (_) { /* fora do alcance */ }
+  });
+}
+
+// troca instantânea: reserva vira ativo (e vice-versa), listeners migram
+function swapPlayers(t, resume) {
+  for (const [ev, fn] of playerEvents) {
+    player.removeEventListener(ev, fn);
+    backPlayer.addEventListener(ev, fn);
+  }
+  backPlayer.volume = player.volume;
+  backPlayer.muted = player.muted;
+  player.pause();
+  player.classList.add("standby");
+  backPlayer.classList.remove("standby");
+  const old = player;
+  player = backPlayer;
+  backPlayer = old;
+  try { player.currentTime = t; } catch (_) { /* posiciona no que der */ }
+  if (resume) player.play();
+}
+
+// pré-carrega no reserva o próximo arquivo distinto da timeline
+function preloadNext() {
+  if (!state.segments.length || !activeSrc) return;
+  const idx = keptIdxAt(activeSrc, player.currentTime);
+  const seg = idx >= 0 ? state.segments[idx] : null;
+  const nxt = seg ? nextKeptAfter(seg) : null;
+  if (!nxt || nxt.src === activeSrc) return;
+  const s = sources.get(nxt.src);
+  if (!s || !s.media) return;
+  backWant = nxt.start + 0.001;
+  if (backPlayer.getAttribute("src") !== s.media) {
+    backPlayer.src = s.media;      // loadedmetadata acima posiciona em backWant
+  } else if (backPlayer.readyState >= 1 &&
+             Math.abs(backPlayer.currentTime - backWant) > 0.3) {
+    try { backPlayer.currentTime = backWant; } catch (_) { }
+  }
+}
 
 // arrastar um arquivo SOMA-o ao fim da timeline (não substitui). Os appends são
 // encadeados numa fila para preservar a ordem de solta mesmo com probes lentos.
@@ -249,6 +305,7 @@ async function prepareSource(path) {
     s.ready = true;
     // se este arquivo é o ativo e estava esperando a mídia, carrega agora
     if (activeSrc === path && !player.getAttribute("src")) switchPlayerTo(path, wantTime);
+    preloadNext();   // a mídia recém-pronta pode ser o próximo da timeline
   } catch (e) {
     s.err = e.message;
     if (activeSrc === path)
@@ -260,16 +317,22 @@ async function prepareSource(path) {
 // trechos de arquivos diferentes). Se a mídia ainda não está pronta, aguarda —
 // prepareSource re-chama quando terminar.
 function switchPlayerTo(src, t) {
+  const resume = activeSrc != null && !player.paused && !player.ended;
   activeSrc = src;
   wantTime = t || 0;
   const s = sources.get(src);
-  if (s && s.media) {
+  if (s && s.media && backPlayer.getAttribute("src") === s.media &&
+      backPlayer.readyState >= 2) {
+    swapPlayers(wantTime, resume);   // reserva já tem este arquivo: troca sem flash
+    drawTimeline();
+  } else if (s && s.media) {
     if (player.getAttribute("src") !== s.media) player.src = s.media; // busca no loadedmetadata
     else { player.currentTime = wantTime; drawTimeline(); }
   } else {
     player.removeAttribute("src");
   }
   updateActiveUI();
+  preloadNext();
 }
 
 // reflete o arquivo ativo na UI: seleção na lista, info e botões de operação
@@ -307,7 +370,7 @@ function pollJob(jobId, intervalMs = 500) {
 }
 
 // ao (re)carregar um arquivo no player, posiciona no instante pedido pela troca
-player.addEventListener("loadedmetadata", () => {
+onPlayerEvent("loadedmetadata", () => {
   if (wantTime && Math.abs(player.currentTime - wantTime) > 0.05) {
     try { player.currentTime = wantTime; } catch (_) { /* fora do alcance */ }
   }
@@ -591,7 +654,7 @@ function nextKeptAfter(seg) {
 // quando o alvo está num arquivo diferente do carregado.
 function seekSource(src, t) {
   if (src && src !== activeSrc) switchPlayerTo(src, t);
-  else seekTo(t);
+  else { seekTo(t); preloadNext(); }
 }
 
 // raspagem ciente de lacuna: se o ponteiro cai numa lacuna, mostra preto e
@@ -652,7 +715,7 @@ function seekTo(t) {
   else player.currentTime = t;
   drawTimeline();
 }
-player.addEventListener("seeked", () => {
+onPlayerEvent("seeked", () => {
   if (pendingSeek != null) { player.currentTime = pendingSeek; pendingSeek = null; }
   drawTimeline();
 });
@@ -826,10 +889,11 @@ function advancePlayback() {
   }
   // 2) dentro de um trecho mantido do arquivo ativo
   const idx = keptIdxAt(activeSrc, t);
-  if (idx === -1) return;
+  if (idx === -1) { jumpPastEnd(t); return; }   // janela do timeupdate perdida
   if (idx !== prevKeptIdx) {            // entrou num novo trecho → toca a lacuna anterior
     prevKeptIdx = idx;
     if ((state.segments[idx].gap || 0) > 0.02) startGapHold(state.segments[idx]);
+    preloadNext();                      // e já deixa o próximo arquivo pronto no reserva
   }
   // ao fim deste trecho, se o próximo é de OUTRO arquivo, pula para ele (senão o
   // <video> continuaria tocando o resto do arquivo ativo além do trecho).
@@ -840,6 +904,18 @@ function advancePlayback() {
   }
 }
 
+// o playhead passou do fim do trecho que tocava (timeupdate pulou a janela de
+// disparo, ou o arquivo acabou): segue para o próximo trecho mantido, se houver
+function jumpPastEnd(t) {
+  const seg = state.segments[prevKeptIdx];
+  if (!seg || seg.deleted || seg.src !== activeSrc) return false;
+  if (t < seg.end - 0.05) return false;
+  const nxt = nextKeptAfter(seg);
+  if (!nxt) return false;
+  goToKept(nxt);
+  return true;
+}
+
 // salta a reprodução para o início de um trecho mantido (troca de arquivo se preciso)
 function goToKept(seg) {
   prevKeptIdx = state.segments.indexOf(seg);
@@ -848,17 +924,22 @@ function goToKept(seg) {
 }
 
 // timeupdate dispara a cada quadro durante a reprodução.
-player.addEventListener("timeupdate", () => {
+onPlayerEvent("timeupdate", () => {
   advancePlayback();
   if (gapHold == null) drawTimeline();   // durante a lacuna quem desenha é o gapHoldStep
 });
-player.addEventListener("play", () => {
+onPlayerEvent("play", () => {
   prevKeptIdx = keptIdxAt(activeSrc, player.currentTime);
   advancePlayback();
+  preloadNext();
 });
-player.addEventListener("pause", () => {
+onPlayerEvent("pause", () => {
   if (!gapHold) { gapVisible = null; setGapOverlay(false); }
   drawTimeline();
+});
+// arquivo chegou ao fim: se o trecho tem sucessor na timeline, continua nele
+onPlayerEvent("ended", () => {
+  if (state.segments.length && jumpPastEnd(player.currentTime)) player.play();
 });
 
 // ---------- corte / deleção / exportação ----------
@@ -968,7 +1049,7 @@ $("btn-export-go").onclick = async () => {
   if (!kept.length) return;
   const srcs = [...new Set(kept.map(s => s.src))];
   const multi = srcs.length > 1;
-  const format = $("export-format").value; // "" = manter original, ou "mp4"
+  const format = $("export-format").value; // "" = manter original, ou "mp4"/"webm"
   // multi-arquivo sempre recodifica/normaliza (formatos podem diferir) → mp4 por padrão
   const ext = multi ? (format || "mp4") : (format || activeSrc.split(".").pop());
   const btn = $("btn-export-go");

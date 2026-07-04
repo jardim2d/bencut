@@ -500,12 +500,17 @@ def op_convert(p):
     else:
         cq = {"alta": "19", "media": "23", "baixa": "28"}[quality]
         if NVENC and p.get("gpu", True):
+            # -forced-idr: sem ela o NVENC ignora o -force_key_frames abaixo
             cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", cq,
-                    "-b:v", "0"]
+                    "-b:v", "0", "-forced-idr", "1"]
         else:
             cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", cq]
         cmd += ["-c:a", "aac", "-b:a", "160k"]
-    cmd += [out]
+    # keyframe a cada 2 s DE TEMPO (não de quadros: gravações de tela são VFR e
+    # emitem poucos quadros, então -g sozinho deixaria intervalos enormes); sem
+    # isso a saída herda o padrão do encoder e vídeos convertidos continuariam
+    # lentos de cortar/buscar depois
+    cmd += ["-force_key_frames", "expr:gte(t,n_forced*2)", out]
     return start_job("convert", cmd, duration, out)
 
 
@@ -622,10 +627,15 @@ def op_render_convert(p):
                 f.write(f"outpoint {e}\n")
     tmp_files.append(lst)
     total = sum((e - s) / sp + gap for s, e, sp, gap in parts)
+    if fmt == "webm":
+        enc = ["-c:v", "libvpx-vp9", "-crf", "31", "-b:v", "0",
+               "-row-mt", "1", "-cpu-used", "2", "-c:a", "libopus", "-b:a", "128k"]
+    else:
+        enc = ["-c:v", "libx264", "-preset", "medium", "-crf", "23",
+               "-c:a", "aac", "-b:a", "160k"]
     cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
-           "-f", "concat", "-safe", "0", "-i", lst,
-           "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-           "-c:a", "aac", "-b:a", "160k", out]
+           "-f", "concat", "-safe", "0", "-i", lst] + enc + \
+        ["-force_key_frames", "expr:gte(t,n_forced*2)", out]
     return start_job("render_convert", cmd, total, out, cleanup=tmp_files)
 
 
