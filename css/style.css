@@ -35,7 +35,7 @@ button.danger:hover:not(:disabled) { border-color: var(--err); color: var(--err)
 button.icon {
   border: none; background: none; padding: 8px 16px; line-height: 1;
 }
-button.icon img { width: 26px; height: 26px; }
+button.icon img { width: 21px; height: 21px; }
 button.icon:hover:not(:disabled) { background: rgba(64,183,227,.15); border-radius: 4px; }
 kbd {
   background: #161616; border: 1px solid var(--line); border-radius: 3px;
