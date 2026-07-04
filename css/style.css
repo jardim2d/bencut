@@ -56,10 +56,12 @@ kbd {
 }
 #side-resizer:hover, #side-resizer.dragging { background: rgba(64,183,227,.35); }
 
-/* navegador: painel inteiro, com scroll próprio */
+/* navegador: painel inteiro, com scroll próprio (roda do mouse; barra oculta) */
 #browser {
   flex: 1; overflow-y: auto;
+  scrollbar-width: none;             /* Firefox */
 }
+#browser::-webkit-scrollbar { display: none; }   /* Chrome */
 #browser-path {
   padding: 10px 14px 6px; font-size: 11px; color: var(--dim);
   word-break: break-all; position: sticky; top: 0; background: var(--panel);
