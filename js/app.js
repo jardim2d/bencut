@@ -170,6 +170,38 @@ async function browse(dir) {
   fillDurations(grid);
 }
 
+// ---------- painel lateral redimensionável ----------
+{
+  const MIN_W = 220;
+  const setSideW = (w) => document.body.style.setProperty("--side-w", w + "px");
+  const saved = parseInt(localStorage.getItem("sideWidth"), 10);
+  if (saved) setSideW(Math.max(MIN_W, saved));
+
+  const rz = $("side-resizer");
+  rz.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    rz.setPointerCapture(e.pointerId);
+    rz.classList.add("dragging");
+    let w = 0;
+    const move = (ev) => {
+      w = Math.min(Math.max(ev.clientX, MIN_W), Math.round(window.innerWidth * 0.6));
+      setSideW(w);
+    };
+    const up = () => {
+      rz.classList.remove("dragging");
+      rz.removeEventListener("pointermove", move);
+      rz.removeEventListener("pointerup", up);
+      if (w) localStorage.setItem("sideWidth", w);
+    };
+    rz.addEventListener("pointermove", move);
+    rz.addEventListener("pointerup", up);
+  });
+  rz.addEventListener("dblclick", () => {        // duplo clique restaura o padrão
+    document.body.style.removeProperty("--side-w");
+    localStorage.removeItem("sideWidth");
+  });
+}
+
 // ---------- player ----------
 // DOIS elementos <video> alternados: enquanto um toca, o outro (reserva,
 // .standby) pré-carrega o próximo arquivo da timeline; na fronteira eles

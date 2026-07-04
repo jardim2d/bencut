@@ -14,7 +14,7 @@ body {
   font: 14px/1.5 system-ui, sans-serif;
   height: 100vh; overflow: hidden;
   display: grid;
-  grid-template-columns: 300px 1fr;
+  grid-template-columns: var(--side-w, 300px) 1fr;
   grid-template-rows: 80vh 20vh;
 }
 
@@ -47,7 +47,14 @@ kbd {
   grid-column: 1; grid-row: 1;
   background: var(--panel); border-right: 1px solid var(--line);
   display: flex; flex-direction: column; min-height: 0;
+  position: relative;
 }
+/* alça de redimensionamento na borda direita do painel */
+#side-resizer {
+  position: absolute; top: 0; right: -3px; width: 7px; height: 100%;
+  cursor: col-resize; z-index: 10;
+}
+#side-resizer:hover, #side-resizer.dragging { background: rgba(64,183,227,.35); }
 
 /* navegador: painel inteiro, com scroll próprio */
 #browser {
