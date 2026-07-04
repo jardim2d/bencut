@@ -165,9 +165,90 @@ async function browse(dir) {
       selectFile(full);                      // edição, vídeo só pré-visualiza
       isProject ? loadProject(full) : previewFile(full);
     };
+    card.addEventListener("contextmenu", (e) => showFileMenu(e, full, f.name));
     grid.appendChild(card);
   }
   fillDurations(grid);
+}
+
+// ---------- menu de contexto (botão direito nos cards) ----------
+let ctxMenu = null;
+function closeCtxMenu() { if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; } }
+document.addEventListener("click", closeCtxMenu);
+document.addEventListener("scroll", closeCtxMenu, true);
+window.addEventListener("blur", closeCtxMenu);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeCtxMenu(); });
+
+function showFileMenu(e, path, name) {
+  e.preventDefault();
+  closeCtxMenu();
+  const menu = document.createElement("div");
+  menu.className = "ctx-menu";
+  const item = (label, cls, fn) => {
+    const b = document.createElement("button");
+    b.className = "ctx-item" + (cls ? " " + cls : "");
+    b.textContent = label;
+    b.onclick = (ev) => { ev.stopPropagation(); closeCtxMenu(); fn(); };
+    menu.appendChild(b);
+  };
+  item("Renomear", "", () => renameFile(path, name));
+  item("Deletar", "danger", () => deleteFile(path, name));
+  document.body.appendChild(menu);
+  // posiciona no cursor sem transbordar a janela
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.min(e.clientX, innerWidth - r.width - 6) + "px";
+  menu.style.top = Math.min(e.clientY, innerHeight - r.height - 6) + "px";
+  ctxMenu = menu;
+}
+
+// renomear/deletar quebrariam a edição se o arquivo estiver na timeline
+const fileInTimeline = (path) => state.segments.some(s => s.src === path);
+
+// limpa caches/estado de um arquivo que sumiu (deletado → newPath null) ou mudou
+// de caminho (renomeado); se ele estava só em pré-visualização, esvazia o player
+function forgetFile(path, newPath) {
+  sources.delete(path);
+  metaCache.delete(path);
+  if (selectedFile === path) selectedFile = newPath;
+  if (activeSrc === path && !hasContent()) {
+    activeSrc = null;
+    player.removeAttribute("src");
+    backPlayer.removeAttribute("src");
+    $("player-wrap").classList.remove("has-video");
+    $("file-info").textContent = "";
+    updateActiveUI();
+  }
+}
+
+async function renameFile(path, name) {
+  if (fileInTimeline(path))
+    return alert("Este arquivo está na timeline. Remova-o da edição antes de renomear.");
+  const novo = prompt("Novo nome do arquivo:", name);
+  if (novo == null) return;               // cancelou
+  const nome = novo.trim();
+  if (!nome || nome === name) return;
+  try {
+    const r = await api("/api/file-rename", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, newName: nome }),
+    });
+    forgetFile(path, r.path);
+    await browse(browseDir);
+  } catch (e) { alert("Erro ao renomear: " + e.message); }
+}
+
+async function deleteFile(path, name) {
+  if (fileInTimeline(path))
+    return alert("Este arquivo está na timeline. Remova-o da edição antes de deletar.");
+  if (!confirm(`Mover para a lixeira?\n\n${name}`)) return;
+  try {
+    await api("/api/file-delete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    forgetFile(path, null);
+    await browse(browseDir);
+  } catch (e) { alert("Erro ao deletar: " + e.message); }
 }
 
 // ---------- painel lateral redimensionável ----------

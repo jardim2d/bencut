@@ -61,6 +61,18 @@ def safe_path(path):
     return real
 
 
+def trash_file(path):
+    """Move o arquivo para a lixeira (reversível) via gio; se o gio não estiver
+    disponível, remove definitivamente."""
+    gio = shutil.which("gio")
+    if gio:
+        r = subprocess.run([gio, "trash", "--", path],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return
+    os.remove(path)
+
+
 def unique_output(dirname, base, suffix, ext):
     """Gera nome de saída que não sobrescreve nada: base_suffix.ext, base_suffix2.ext…"""
     n = 0
@@ -984,6 +996,35 @@ class Handler(BaseHTTPRequestHandler):
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(body["project"], f, ensure_ascii=False, indent=1)
                 return self._json({"path": path})
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
+        if self.path == "/api/file-rename":
+            try:
+                src = safe_path(body["path"])
+                if not os.path.isfile(src):
+                    raise ValueError("arquivo não encontrado")
+                new_name = (body.get("newName") or "").strip()
+                if not new_name or "/" in new_name or "\\" in new_name \
+                        or new_name.startswith("."):
+                    raise ValueError("nome inválido")
+                dst = safe_path(os.path.join(os.path.dirname(src), new_name))
+                if os.path.dirname(dst) != os.path.dirname(src):
+                    raise ValueError("nome inválido")
+                if os.path.exists(dst):
+                    raise ValueError("já existe um arquivo com esse nome")
+                os.rename(src, dst)
+                return self._json({"path": dst})
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
+        if self.path == "/api/file-delete":
+            try:
+                src = safe_path(body["path"])
+                if not os.path.isfile(src):
+                    raise ValueError("arquivo não encontrado")
+                trash_file(src)
+                return self._json({"ok": True})
             except Exception as e:
                 return self._json({"error": str(e)}, 400)
 
