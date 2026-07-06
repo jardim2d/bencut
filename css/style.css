@@ -32,6 +32,11 @@ button.primary {
 }
 button.primary:hover:not(:disabled) { background: var(--blue-dark); border-color: var(--blue-dark); }
 button.danger:hover:not(:disabled) { border-color: var(--err); color: var(--err); }
+/* botão de cancelar a exportação: fundo vermelho (vence o azul de #cut-controls button) */
+#cut-controls #btn-export-cancel {
+  background: var(--err); border-color: var(--err); color: #2a0f0d;
+}
+#cut-controls #btn-export-cancel:hover:not(:disabled) { background: #c74d43; border-color: #c74d43; color: #2a0f0d; }
 button.icon {
   border: none; background: none; padding: 8px 16px; line-height: 1;
 }
