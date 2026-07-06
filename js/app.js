@@ -1078,7 +1078,29 @@ function deleteSelected() {
   if (selectedSeg == null || state.segments[selectedSeg]?.deleted) return;
   const i = selectedSeg;
   selectedSeg = null;
+  // era o único trecho aproveitado? apagá-lo deixaria a timeline só com lacunas
+  // pretas, sem nada para editar ou exportar. Zera tudo, como recarregar a página.
+  if (keptSegs().length === 1) { resetEditor(); return; }
   apply(s => { s.segments[i].deleted = true; });
+}
+
+// volta ao estado inicial da edição — timeline, player, histórico, zoom/pan —
+// como se a página tivesse sido recarregada. O navegador de arquivos fica onde
+// está (um refresh de verdade voltaria à pasta inicial, mais atrapalha que ajuda).
+function resetEditor() {
+  state.segments = [];
+  history.past = []; history.future = [];
+  selectedSeg = null;
+  activeSrc = null; wantTime = 0;
+  sources.clear();
+  tlZoom = 1; tlView = 0;
+  cancelAnimationFrame(layoutAnimId);
+  animPos.clear(); animDur = 0;
+  for (const el of [player, backPlayer]) { el.pause(); el.removeAttribute("src"); el.load(); }
+  $("player-wrap").classList.remove("has-video");
+  $("file-info").textContent = "";
+  updateActiveUI();
+  renderState();
 }
 // a própria escolha no seletor já aplica a velocidade ao segmento selecionado
 function setSpeedSelected() {
