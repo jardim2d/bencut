@@ -930,6 +930,22 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"error": str(e)}, 400)
 
+        if route == "/api/pick-dir":
+            try:
+                title = q.get("title", ["Escolher pasta de destino"])[0]
+                start = q.get("start", [START_DIR])[0]
+                cmd = ["zenity", "--file-selection", "--directory",
+                       f"--title={title}", f"--filename={start}/"]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                if r.returncode != 0:
+                    return self._json({"cancelled": True})
+                return self._json({"path": safe_path(r.stdout.strip())})
+            except FileNotFoundError:
+                return self._json(
+                    {"error": "zenity não encontrado (instale: sudo apt install zenity)"}, 500)
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
         if route == "/api/pick-save":
             try:
                 src = safe_path(q["input"][0])
@@ -1014,6 +1030,26 @@ class Handler(BaseHTTPRequestHandler):
                 if os.path.exists(dst):
                     raise ValueError("já existe um arquivo com esse nome")
                 os.rename(src, dst)
+                return self._json({"path": dst})
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
+        if self.path == "/api/file-move":
+            try:
+                src = safe_path(body["path"])
+                if not os.path.isfile(src):
+                    raise ValueError("arquivo não encontrado")
+                dst_dir = safe_path(body["destDir"])
+                if not os.path.isdir(dst_dir):
+                    raise ValueError("pasta de destino inválida")
+                if dst_dir == os.path.dirname(src):
+                    raise ValueError("o arquivo já está nessa pasta")
+                dst = safe_path(os.path.join(dst_dir, os.path.basename(src)))
+                if os.path.dirname(dst) != dst_dir:
+                    raise ValueError("destino inválido")
+                if os.path.exists(dst):
+                    raise ValueError("já existe um arquivo com esse nome no destino")
+                shutil.move(src, dst)
                 return self._json({"path": dst})
             except Exception as e:
                 return self._json({"error": str(e)}, 400)

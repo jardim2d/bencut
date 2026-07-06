@@ -192,6 +192,7 @@ function showFileMenu(e, path, name) {
     menu.appendChild(b);
   };
   item("Renomear", "", () => renameFile(path, name));
+  item("Mover…", "", () => moveFile(path, name));
   item("Deletar", "danger", () => deleteFile(path, name));
   document.body.appendChild(menu);
   // posiciona no cursor sem transbordar a janela
@@ -202,7 +203,7 @@ function showFileMenu(e, path, name) {
 }
 
 // renomear/deletar quebrariam a edição se o arquivo estiver na timeline
-const fileInTimeline = (path) => state.segments.some(s => s.src === path);
+const fileInTimeline = (path) => state.segments.some(s => !s.deleted && s.src === path);
 
 // limpa caches/estado de um arquivo que sumiu (deletado → newPath null) ou mudou
 // de caminho (renomeado); se ele estava só em pré-visualização, esvazia o player
@@ -235,6 +236,25 @@ async function renameFile(path, name) {
     forgetFile(path, r.path);
     await browse(browseDir);
   } catch (e) { alert("Erro ao renomear: " + e.message); }
+}
+
+async function moveFile(path, name) {
+  if (fileInTimeline(path))
+    return alert("Este arquivo está na timeline. Remova-o da edição antes de mover.");
+  let picked;
+  try {
+    picked = await api("/api/pick-dir?title=" +
+      encodeURIComponent(`Mover "${name}" para…`));
+  } catch (e) { return alert("Erro ao escolher a pasta: " + e.message); }
+  if (picked.cancelled) return;               // fechou o seletor
+  try {
+    const r = await api("/api/file-move", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, destDir: picked.path }),
+    });
+    forgetFile(path, r.path);                  // saiu da pasta atual → some do grid
+    await browse(browseDir);
+  } catch (e) { alert("Erro ao mover: " + e.message); }
 }
 
 async function deleteFile(path, name) {
