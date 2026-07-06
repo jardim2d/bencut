@@ -503,6 +503,9 @@ let layoutAnimId = null;
 
 const segKey = (s) => s.src + "@" + s.start.toFixed(3) + ":" + s.end.toFixed(3);
 const keptSegs = () => state.segments.filter(s => !s.deleted);
+// duração VISÍVEL do trecho, já com a aceleração aplicada: um trecho a 2x ocupa
+// metade da largura na timeline — igual ao que sai na exportação.
+const segVis = (s) => (s.end - s.start) / (s.speed || 1);
 
 function targetLayout() {
   const pos = new Map();
@@ -510,7 +513,7 @@ function targetLayout() {
   for (const s of keptSegs()) {
     acc += s.gap || 0;          // lacuna (preta) antes do segmento
     pos.set(segKey(s), acc);    // início visível do segmento é depois da lacuna
-    acc += s.end - s.start;
+    acc += segVis(s);
   }
   return { pos, dur: acc };
 }
@@ -559,9 +562,9 @@ function sourceToVisible(src, t) {
     const p = animPos.get(segKey(s)) ?? 0;
     if (s.src === src) {
       if (t < s.start) return p;             // dentro de parte deletada deste arquivo
-      if (t <= s.end) return p + (t - s.start);
+      if (t <= s.end) return p + (t - s.start) / (s.speed || 1);
     }
-    prevEnd = p + (s.end - s.start);
+    prevEnd = p + segVis(s);
   }
   return prevEnd;
 }
@@ -574,9 +577,9 @@ function visibleToSource(tv) {
   let acc = 0;
   for (const s of kept) {
     acc += s.gap || 0;               // pula a lacuna preta antes do trecho
-    const d = s.end - s.start;
+    const d = segVis(s), sp = s.speed || 1;
     if (tv < acc) return { src: s.src, t: s.start };     // na lacuna → início do trecho seguinte
-    if (tv <= acc + d) return { src: s.src, t: s.start + (tv - acc) };
+    if (tv <= acc + d) return { src: s.src, t: s.start + (tv - acc) * sp };
     acc += d;
   }
   const l = kept[kept.length - 1];
@@ -589,7 +592,7 @@ function visibleGapAt(tv) {
   for (const s of keptSegs()) {
     const g = s.gap || 0;
     if (tv < acc + g) return tv >= acc - 1e-6;   // dentro da faixa da lacuna
-    acc += g + (s.end - s.start);
+    acc += g + segVis(s);
   }
   return false;
 }
@@ -658,7 +661,7 @@ function drawTimeline() {
       ctx.fillRect(x - dpr / 2, segTop, dpr, segH);
     }
     const x0 = sx(visStart);
-    const wd = (s.end - s.start) * scale;
+    const wd = segVis(s) * scale;
     const sel = i === selectedSeg;
     const hue = s.hue ?? 210;                    // cor própria e estável do segmento
     ctx.fillStyle = `hsla(${hue}, 62%, 55%, ${sel ? 0.82 : 0.55})`;
@@ -674,7 +677,7 @@ function drawTimeline() {
       ctx.textBaseline = "top";
       ctx.fillText(`${s.speed}x`, x0 + 4 * dpr, segTop + 2 * dpr);
     }
-    prevVisEnd = visStart + (s.end - s.start);
+    prevVisEnd = visStart + segVis(s);
   }
 
   drawRuler(w, h, rulerH, scale);
@@ -808,7 +811,7 @@ function visibleAtEvent(e) {
 function segIndexAtVisible(vt) {
   for (const s of keptSegs()) {
     const p = animPos.get(segKey(s)) ?? 0;
-    if (vt >= p && vt <= p + (s.end - s.start)) return state.segments.indexOf(s);
+    if (vt >= p && vt <= p + segVis(s)) return state.segments.indexOf(s);
   }
   return -1;
 }
@@ -895,14 +898,14 @@ canvas.addEventListener("pointermove", (e) => {
     const dxr = (e.clientX - segMoveBaseX) / rect.width * segMoveSpan0;
     const ni = nextKeptIdx(segMoveIdx), pi = prevKeptIdxOf(segMoveIdx);
     if (dxr > 0 && ni !== -1 &&
-        dxr - segMoveOrigNextGap >= (state.segments[ni].end - state.segments[ni].start) / 2) {
+        dxr - segMoveOrigNextGap >= segVis(state.segments[ni]) / 2) {
       const seg = state.segments.splice(segMoveIdx, 1)[0];  // dragado passa p/ depois do próximo
       state.segments.splice(ni, 0, seg);
       segMoveIdx = ni;
       const f = state.segments.find(s => !s.deleted); if (f) f.gap = 0; // sem preto solto no início
       rebase();
     } else if (dxr < 0 && pi !== -1 &&
-        -dxr - segMoveOrigGap >= (state.segments[pi].end - state.segments[pi].start) / 2) {
+        -dxr - segMoveOrigGap >= segVis(state.segments[pi]) / 2) {
       const seg = state.segments.splice(segMoveIdx, 1)[0];  // dragado passa p/ antes do anterior
       state.segments.splice(pi, 0, seg);
       segMoveIdx = pi;
@@ -1011,6 +1014,8 @@ function advancePlayback() {
   // ao fim deste trecho, se o próximo é de OUTRO arquivo, pula para ele (senão o
   // <video> continuaria tocando o resto do arquivo ativo além do trecho).
   const seg = state.segments[idx];
+  const rate = seg.speed || 1;          // preview honra a aceleração do trecho tocado
+  if (player.playbackRate !== rate) player.playbackRate = rate;
   if (t >= seg.end - 0.05) {
     const nxt = nextKeptAfter(seg);
     if (nxt && nxt.src !== activeSrc) goToKept(nxt);
