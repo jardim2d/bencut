@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""EditorVideo — servidor local que serve a UI e executa operações FFmpeg.
+"""BenCut — servidor local que serve a UI e executa operações FFmpeg.
 
 Uso: python3 server.py  →  http://localhost:8765
 """
@@ -21,12 +21,21 @@ HOME = os.path.expanduser("~")
 START_DIR = os.path.join(HOME, "Vídeos") if os.path.isdir(os.path.join(HOME, "Vídeos")) else HOME
 
 VIDEO_EXTS = {".mp4", ".mkv", ".m4v", ".mov", ".avi", ".webm", ".ts", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp"}
-PROJECT_EXT = ".evp"   # projeto do EditorVideo (JSON com os segmentos da timeline)
+AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav", ".wma"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".tif", ".tiff"}
+PROJECT_EXT = ".evp"   # projeto do BenCut (JSON com os segmentos da timeline)
+# content-type por extensão de imagem (para o <img> exibir corretamente)
+IMAGE_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+              ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+              ".avif": "image/avif", ".tif": "image/tiff", ".tiff": "image/tiff"}
 AUDIO_COPY = {"aac": ".m4a", "mp3": ".mp3", "opus": ".opus", "flac": ".flac", "vorbis": ".ogg"}
 
 # formatos que o <video> do navegador reproduz nativamente; os demais (mkv,
 # avi, wmv, flv, ts, mpg, 3gp…) precisam de uma prévia transcodificada
 DIRECT_PLAYABLE_EXTS = {".mp4", ".m4v", ".mov", ".webm"}
+# áudios que o navegador toca direto no player (sem transcodificar); wma fica
+# de fora e cai no caminho de prévia
+BROWSER_PLAYABLE_AUDIO = {".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav"}
 PREVIEW_CACHE_DIR = os.path.join(HOME, ".cache", "editorvideo", "previews")
 os.makedirs(PREVIEW_CACHE_DIR, exist_ok=True)
 THUMB_CACHE_DIR = os.path.join(HOME, ".cache", "editorvideo", "thumbs")
@@ -110,7 +119,8 @@ def probe(path):
 
 
 def needs_preview(path):
-    return os.path.splitext(path)[1].lower() not in DIRECT_PLAYABLE_EXTS
+    ext = os.path.splitext(path)[1].lower()
+    return ext not in DIRECT_PLAYABLE_EXTS and ext not in BROWSER_PLAYABLE_AUDIO
 
 
 def cache_key(src):
@@ -160,8 +170,11 @@ def make_thumb(src):
     t = min(dur * 0.1, 5.0) if dur > 0 else 0.0
     with THUMB_SEM:
         for ss in ([t, 0.0] if t > 0 else [0.0]):
+            # -ss só quando >0: em imagens estáticas, "-ss 0" cai depois do único
+            # frame e gera saída vazia (o mesmo -ss 0 é inócuo em vídeos)
+            seek = ["-ss", f"{ss:.3f}"] if ss > 0 else []
             r = subprocess.run(
-                [FFMPEG, "-nostdin", "-y", "-ss", f"{ss:.3f}", "-i", src,
+                [FFMPEG, "-nostdin", "-y", *seek, "-i", src,
                  "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "4", out],
                 capture_output=True, text=True, timeout=60)
             if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
@@ -273,6 +286,86 @@ def encode_edge(src, start, end, info, out_dir, tmp_files, use_nvenc):
     return tmp_out
 
 
+_FONT = None
+def find_font():
+    """Localiza uma fonte TTF do sistema para o drawtext (cacheada)."""
+    global _FONT
+    if _FONT:
+        return _FONT
+    import glob
+    for pat in ["/usr/share/fonts/**/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/**/DejaVuSans.ttf",
+                "/usr/share/fonts/**/FreeSansBold.ttf",
+                "/usr/share/fonts/**/*.ttf"]:
+        m = glob.glob(pat, recursive=True)
+        if m:
+            _FONT = m[0]
+            return _FONT
+    raise RuntimeError("nenhuma fonte TTF encontrada para desenhar textos")
+
+
+def drawtext_filters(texts, height, out_dir, tmp_files):
+    """Cadeia de drawtext p/ gravar os textos no vídeo exportado.
+
+    texts = [{text, start, end, pos}] com tempos na linha do tempo do ARQUIVO
+    FINAL (o filtro roda depois da concatenação). Estilo espelha o preview:
+    branco, caixa preta translúcida, fonte ~altura/14, ancorado em h/12.
+
+    O conteúdo vai em textfile= (arquivo temporário) porque no FFmpeg 7 as
+    aspas não protegem mais ':' no parser de opções — assim nenhum caractere
+    do usuário precisa de escape. Só as vírgulas do between() levam '\\,'.
+    """
+    font = find_font()
+    fs = max(12, int(height) // 14)
+    bw = max(4, fs // 5)
+    chain = []
+    for t in texts:
+        tf = os.path.join(out_dir, f".text_{uuid.uuid4().hex[:8]}.txt")
+        with open(tf, "w") as f:
+            f.write(str(t.get("text", "")))
+        tmp_files.append(tf)
+        pos = t.get("pos", "bottom")
+        if pos == "top":
+            xy = "x=(w-text_w)/2:y=h/12"
+        elif pos == "center":
+            xy = "x=(w-text_w)/2:y=(h-text_h)/2"
+        else:
+            xy = "x=(w-text_w)/2:y=h-text_h-h/12"
+        st, en = float(t.get("start", 0)), float(t.get("end", 0))
+        chain.append(
+            f"drawtext=fontfile={font}:textfile={tf}:expansion=none:"
+            f"enable=between(t\\,{st:.3f}\\,{en:.3f}):fontcolor=white:fontsize={fs}:"
+            f"box=1:boxcolor=black@0.45:boxborderw={bw}:{xy}")
+    return ",".join(chain)
+
+
+def parse_part(x):
+    """Normaliza um item de `parts` [start, end, speed, gap, vol, op, fadein,
+    fadeout] — campos ausentes (payloads antigos) assumem o valor neutro."""
+    dflt = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0]
+    vals = [float(v) for v in x] + dflt[len(x):]
+    return tuple(vals[:8])
+
+
+def part_needs_encode(sp, vol, op, fi, fo):
+    """True se o trecho tem algum ajuste que não sai com stream copy."""
+    return (abs(sp - 1.0) > 1e-6 or abs(vol - 1.0) > 1e-6 or
+            abs(op - 1.0) > 1e-6 or fi > 1e-6 or fo > 1e-6)
+
+
+def clip_vf_extras(op, fadein, fadeout, vis_dur):
+    """Filtros de vídeo por trecho além do setpts: opacidade (fusão para preto,
+    escalando RGB) e fades preto de entrada/saída. Tempos na saída do trecho."""
+    extras = []
+    if abs(op - 1.0) > 1e-6:
+        extras.append(f"lutrgb=r=val*{op:.4f}:g=val*{op:.4f}:b=val*{op:.4f},format=yuv420p")
+    if fadein > 1e-6:
+        extras.append(f"fade=t=in:st=0:d={fadein:.3f}")
+    if fadeout > 1e-6:
+        extras.append(f"fade=t=out:st={max(0.0, vis_dur - fadeout):.3f}:d={fadeout:.3f}")
+    return extras
+
+
 def atempo_chain(speed):
     """O filtro atempo só aceita [0.5, 2.0]; encadeia para cobrir qualquer fator."""
     filters, remaining = [], speed
@@ -286,12 +379,14 @@ def atempo_chain(speed):
     return ",".join(filters)
 
 
-def encode_speed(src, start, end, speed, info, out_dir, tmp_files, use_nvenc):
-    """Recodifica [start, end) de `src` já acelerado/desacelerado por `speed`x.
+def encode_speed(src, start, end, speed, info, out_dir, tmp_files, use_nvenc,
+                 vol=1.0, op=1.0, fadein=0.0, fadeout=0.0):
+    """Recodifica [start, end) de `src` com velocidade, volume, opacidade e
+    fades preto de transição aplicados (1.0/0 = sem alteração).
 
-    Sempre precisa recodificar (não dá pra mudar velocidade com stream copy);
-    usa o mesmo codec de origem para poder concatenar o resultado com o resto
-    do arquivo por stream copy quando o segmento vizinho não for alterado.
+    Sempre precisa recodificar (nada disso sai com stream copy); usa o mesmo
+    codec de origem para poder concatenar o resultado com o resto do arquivo
+    por stream copy quando o segmento vizinho não for alterado.
     """
     vcodec = info["video"]["codec"] if info["video"] else None
     vargs = None
@@ -304,10 +399,15 @@ def encode_speed(src, start, end, speed, info, out_dir, tmp_files, use_nvenc):
             f"aceleração não suportada para o codec de vídeo '{vcodec}'")
     ext = os.path.splitext(src)[1]
     tmp_out = os.path.join(out_dir, f".speed_{uuid.uuid4().hex[:8]}{ext}")
-    vf = ["-vf", f"setpts=PTS/{speed}"]
+    vchain = [f"setpts=PTS/{speed}"] + \
+        clip_vf_extras(op, fadein, fadeout, (end - start) / speed)
+    vf = ["-vf", ",".join(vchain)]
     if info["audio"]:
         acodec = EDGE_AUDIO_ENCODERS.get(info["audio"]["codec"], ["-c:a", "aac", "-b:a", "192k"])
-        aargs = ["-af", atempo_chain(speed)] + acodec
+        af = atempo_chain(speed)
+        if abs(vol - 1.0) > 1e-6:
+            af += f",volume={vol:.4f}"
+        aargs = ["-af", af] + acodec
     else:
         aargs = ["-an"]
 
@@ -574,12 +674,11 @@ def op_delete(p):
 
 
 def op_render(p):
-    """Monta o vídeo a partir dos segmentos mantidos [[start, end, speed], ...], com
-    -c copy — segmentos com speed != 1 são recodificados antes (não dá pra mudar
-    velocidade com stream copy) e emendados aos demais igual às bordas de corte."""
+    """Monta o vídeo a partir dos segmentos mantidos [[start, end, speed, gap, vol]…],
+    com -c copy — segmentos com speed != 1 ou volume != 1 são recodificados antes
+    (não dá com stream copy) e emendados aos demais igual às bordas de corte."""
     src = safe_path(p["input"])
-    parts = [(float(x[0]), float(x[1]), float(x[2]), float(x[3]) if len(x) > 3 else 0.0)
-             for x in p["parts"]]
+    parts = [parse_part(x) for x in p["parts"]]
     if not parts:
         raise ValueError("nenhum segmento restante para exportar")
     info = probe(src)
@@ -588,12 +687,13 @@ def op_render(p):
     out = safe_path(p["output"]) if p.get("output") else unique_output(d, name[0], "editado", name[1])
     tmp_files = []
     lines = []
-    for s, e, sp, gap in parts:
+    for s, e, sp, gap, vol, op, fi, fo in parts:
         if gap > 0.001:   # lacuna → trecho de preto+silêncio antes do segmento
             blk = encode_black(gap, info, src, d, tmp_files, NVENC)
             lines.append(f"file '{blk.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
-        if abs(sp - 1.0) > 1e-6:
-            seg = encode_speed(src, s, e, sp, info, d, tmp_files, NVENC)
+        if part_needs_encode(sp, vol, op, fi, fo):
+            seg = encode_speed(src, s, e, sp, info, d, tmp_files, NVENC,
+                               vol=vol, op=op, fadein=fi, fadeout=fo)
             lines.append(f"file '{seg.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
         else:
             lines += build_segment(src, s, e, info, keyframes, d, tmp_files, NVENC)
@@ -601,7 +701,7 @@ def op_render(p):
     with open(lst, "w") as f:
         f.writelines(lines)
     tmp_files.append(lst)
-    total = sum((e - s) / sp + gap for s, e, sp, gap in parts)
+    total = sum((e - s) / sp + gap for s, e, sp, gap, *_ in parts)
     cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
            "-f", "concat", "-safe", "0", "-i", lst,
            "-c", "copy", "-avoid_negative_ts", "make_zero", out]
@@ -613,8 +713,7 @@ def op_render_convert(p):
     speed != 1 passam antes por encode_speed (todo o resto já é recodificado
     aqui mesmo, então não precisa casar codec nem alinhar keyframe)."""
     src = safe_path(p["input"])
-    parts = [(float(x[0]), float(x[1]), float(x[2]), float(x[3]) if len(x) > 3 else 0.0)
-             for x in p["parts"]]
+    parts = [parse_part(x) for x in p["parts"]]
     fmt = p.get("format", "mp4")
     if not parts:
         raise ValueError("nenhum segmento restante para exportar")
@@ -625,12 +724,13 @@ def op_render_convert(p):
     tmp_files = []
     lst = out + ".txt"
     with open(lst, "w") as f:
-        for s, e, sp, gap in parts:
+        for s, e, sp, gap, vol, op, fi, fo in parts:
             if gap > 0.001:
                 blk = encode_black(gap, info, src, d, tmp_files, NVENC)
                 f.write(f"file '{blk.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
-            if abs(sp - 1.0) > 1e-6:
-                seg = encode_speed(src, s, e, sp, info, d, tmp_files, NVENC)
+            if part_needs_encode(sp, vol, op, fi, fo):
+                seg = encode_speed(src, s, e, sp, info, d, tmp_files, NVENC,
+                                   vol=vol, op=op, fadein=fi, fadeout=fo)
                 f.write(f"file '{seg.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
             else:
                 f.write(f"file '{esc}'\n")
@@ -638,15 +738,20 @@ def op_render_convert(p):
                     f.write(f"inpoint {s}\n")
                 f.write(f"outpoint {e}\n")
     tmp_files.append(lst)
-    total = sum((e - s) / sp + gap for s, e, sp, gap in parts)
+    total = sum((e - s) / sp + gap for s, e, sp, gap, *_ in parts)
     if fmt == "webm":
         enc = ["-c:v", "libvpx-vp9", "-crf", "31", "-b:v", "0",
                "-row-mt", "1", "-cpu-used", "2", "-c:a", "libopus", "-b:a", "128k"]
     else:
         enc = ["-c:v", "libx264", "-preset", "medium", "-crf", "23",
                "-c:a", "aac", "-b:a", "160k"]
+    # textos gravados sobre o vídeo final (tempos já na linha do tempo da saída)
+    texts = p.get("texts") or []
+    vf = []
+    if texts and info["video"]:
+        vf = ["-vf", drawtext_filters(texts, info["video"]["height"], d, tmp_files)]
     cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
-           "-f", "concat", "-safe", "0", "-i", lst] + enc + \
+           "-f", "concat", "-safe", "0", "-i", lst] + vf + enc + \
         ["-force_key_frames", "expr:gte(t,n_forced*2)", out]
     return start_job("render_convert", cmd, total, out, cleanup=tmp_files)
 
@@ -660,10 +765,9 @@ def op_render_multi(p):
     pelo filtro concat, recodificando uma única vez. As lacunas viram trechos de
     preto+silêncio já no tamanho-alvo.
 
-    parts = [[src, start, end, speed, gap], ...]
+    parts = [[src, start, end, speed, gap, vol, op, fadein, fadeout], ...]
     """
-    parts = [(safe_path(x[0]), float(x[1]), float(x[2]), float(x[3]),
-              float(x[4]) if len(x) > 4 else 0.0) for x in p["parts"]]
+    parts = [(safe_path(x[0]),) + parse_part(x[1:]) for x in p["parts"]]
     if not parts:
         raise ValueError("nenhum segmento para exportar")
     fmt = p.get("format") or "mp4"
@@ -701,19 +805,22 @@ def op_render_multi(p):
         afilters.append(f"[{ai}:a]aformat=sample_fmts=fltp:channel_layouts=stereo[a{ai}]")
         labels.append((f"v{vi}", f"a{ai}"))
 
-    def add_clip(src, s, e, sp):
+    def add_clip(src, s, e, sp, vol=1.0, op=1.0, fi=0.0, fo=0.0):
         nonlocal idx
         # trim por -ss/-to na entrada (rápido); depois normaliza no grafo
         inputs.extend(["-ss", f"{s}", "-to", f"{e}", "-i", src])
         vi = idx
         idx += 1
-        vfilters.append(
-            f"[{vi}:v]setpts=PTS/{sp:.6f},"
+        vchain = [
+            f"setpts=PTS/{sp:.6f}",
             f"scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps={FPS},setsar=1,format=yuv420p[v{vi}]")
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps={FPS},setsar=1,format=yuv420p",
+        ] + clip_vf_extras(op, fi, fo, (e - s) / sp)
+        vfilters.append(f"[{vi}:v]" + ",".join(vchain) + f"[v{vi}]")
         if infos[src]["audio"]:
+            volf = f"volume={vol:.4f}," if abs(vol - 1.0) > 1e-6 else ""
             afilters.append(
-                f"[{vi}:a]{atempo_chain(sp)},aresample={SR},"
+                f"[{vi}:a]{atempo_chain(sp)},{volf}aresample={SR},"
                 f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{vi}]")
             labels.append((f"v{vi}", f"a{vi}"))
         else:  # arquivo sem áudio: gera silêncio da mesma duração para o concat casar
@@ -725,19 +832,26 @@ def op_render_multi(p):
             afilters.append(f"[{ai}:a]aformat=sample_fmts=fltp:channel_layouts=stereo[a{ai}]")
             labels.append((f"v{vi}", f"a{ai}"))
 
-    for src, s, e, sp, gap in parts:
+    for src, s, e, sp, gap, vol, op, fi, fo in parts:
         if gap > 0.001:
             add_black(gap)
-        add_clip(src, s, e, sp)
-
-    n = len(labels)
-    concat_in = "".join(f"[{v}][{a}]" for v, a in labels)
-    graph = ";".join(vfilters + afilters +
-                     [f"{concat_in}concat=n={n}:v=1:a=1[vout][aout]"])
+        add_clip(src, s, e, sp, vol, op, fi, fo)
 
     d = os.path.dirname(parts[0][0])
     base = os.path.splitext(os.path.basename(parts[0][0]))[0]
     out = safe_path(p["output"]) if p.get("output") else unique_output(d, base, "editado", "." + fmt)
+
+    n = len(labels)
+    concat_in = "".join(f"[{v}][{a}]" for v, a in labels)
+    nodes = vfilters + afilters + [f"{concat_in}concat=n={n}:v=1:a=1[vout][aout]"]
+    # textos gravados por cima do vídeo já concatenado (tempos = saída final)
+    texts = p.get("texts") or []
+    tmp_files = []
+    vmap = "[vout]"
+    if texts:
+        nodes.append(f"[vout]{drawtext_filters(texts, H, d, tmp_files)}[vtxt]")
+        vmap = "[vtxt]"
+    graph = ";".join(nodes)
 
     if fmt == "webm":
         venc = ["-c:v", "libvpx-vp9", "-crf", "31", "-b:v", "0", "-row-mt", "1", "-cpu-used", "2"]
@@ -749,15 +863,72 @@ def op_render_multi(p):
         aenc = ["-c:a", "aac", "-b:a", "160k"]
         tail = ["-movflags", "+faststart"]
 
-    total = sum((e - s) / sp + gap for _, s, e, sp, gap in parts)
+    total = sum((e - s) / sp + gap for _, s, e, sp, gap, *_ in parts)
     cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats"] + inputs + \
-        ["-filter_complex", graph, "-map", "[vout]", "-map", "[aout]"] + venc + aenc + tail + [out]
-    return start_job("render_multi", cmd, total, out)
+        ["-filter_complex", graph, "-map", vmap, "-map", "[aout]"] + venc + aenc + tail + [out]
+    return start_job("render_multi", cmd, total, out, cleanup=tmp_files)
+
+
+def op_mix_audio(p):
+    """2ª passagem da exportação: mixa a trilha de áudio sobre um vídeo já
+    renderizado. O vídeo é COPIADO (sem re-encode); só o áudio é recodificado.
+
+    input  = vídeo-base (temporário, apagado ao fim)
+    tracks = [[src, start, end, at, volume], ...]  (at = posição em s na saída)
+    """
+    base = safe_path(p["input"]) if p.get("input") else None
+    tracks = [(safe_path(x[0]), float(x[1]), float(x[2]), float(x[3]),
+               float(x[4]) if len(x) > 4 else 1.0) for x in p["tracks"]]
+    out = safe_path(p["output"])
+    fmt = p.get("format") or os.path.splitext(out)[1].lstrip(".") or "mp4"
+
+    inputs = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]
+    if base:                                   # mixa sobre um vídeo já renderizado
+        base_info = probe(base)
+        base_dur = base_info["duration"]
+        base_has_audio = bool(base_info["audio"])
+        inputs += ["-i", base]
+    else:                                       # projeto só de áudio: base preta
+        base_dur = float(p.get("base_duration") or 0) or max(
+            (at + (e - s) for _, s, e, at, _v in tracks), default=1.0)
+        base_has_audio = False
+        inputs += ["-f", "lavfi", "-t", f"{base_dur:.3f}",
+                   "-i", "color=c=black:s=1280x720:r=30"]
+    labels, filters = [], []
+    if base_has_audio:
+        labels.append("[0:a]")
+    for k, (src, s, e, at, vol) in enumerate(tracks, start=1):
+        inputs += ["-ss", f"{s}", "-to", f"{e}", "-i", src]
+        ms = int(round(at * 1000))
+        volf = f"volume={vol:.4f}," if abs(vol - 1.0) > 1e-6 else ""
+        # adelay atrasa cada trilha até sua posição na linha do tempo da saída
+        filters.append(f"[{k}:a]{volf}adelay={ms}|{ms},aresample=48000[a{k}]")
+        labels.append(f"[a{k}]")
+    n = len(labels)
+    # normalize=0 preserva os níveis (amix por padrão divide pela contagem)
+    filters.append(f"{''.join(labels)}amix=inputs={n}:normalize=0:"
+                   f"dropout_transition=0[aout]")
+    graph = ";".join(filters)
+
+    aenc = ["-c:a", "libopus", "-b:a", "160k"] if fmt == "webm" \
+        else ["-c:a", "aac", "-b:a", "192k"]
+    tail = ["-movflags", "+faststart"] if fmt == "mp4" else []
+    # com base real, copia o vídeo; base preta sintetizada precisa ser codificada
+    if base:
+        venc = ["-c:v", "copy"]
+    elif fmt == "webm":
+        venc = ["-c:v", "libvpx-vp9", "-crf", "34", "-b:v", "0", "-row-mt", "1", "-cpu-used", "4"]
+    else:
+        venc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-pix_fmt", "yuv420p"]
+    cmd = inputs + ["-filter_complex", graph,
+                    "-map", "0:v", "-map", "[aout]"] + venc + aenc + tail + [out]
+    return start_job("mix_audio", cmd, base_dur, out, cleanup=[base] if base else None)
 
 
 OPS = {"cut": op_cut, "join": op_join, "convert": op_convert,
        "extract": op_extract_audio, "delete": op_delete, "render": op_render,
-       "render_convert": op_render_convert, "render_multi": op_render_multi}
+       "render_convert": op_render_convert, "render_multi": op_render_multi,
+       "mix_audio": op_mix_audio}
 
 
 # ---------- HTTP ----------
@@ -816,7 +987,8 @@ class Handler(BaseHTTPRequestHandler):
                     end = min(int(m.group(2)), size - 1)
         length = end - start + 1
         self.send_response(206 if rng else 200)
-        self.send_header("Content-Type", "video/mp4")
+        ctype = IMAGE_MIME.get(os.path.splitext(path)[1].lower(), "video/mp4")
+        self.send_header("Content-Type", ctype)
         self.send_header("Accept-Ranges", "bytes")
         if rng:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
@@ -860,10 +1032,20 @@ class Handler(BaseHTTPRequestHandler):
                     full = os.path.join(d, name)
                     if os.path.isdir(full):
                         entries["dirs"].append(name)
-                    elif os.path.splitext(name)[1].lower() in VIDEO_EXTS \
-                            or name.lower().endswith(PROJECT_EXT):
-                        entries["files"].append(
-                            {"name": name, "size": os.path.getsize(full)})
+                        continue
+                    ext = os.path.splitext(name)[1].lower()
+                    if ext in VIDEO_EXTS:
+                        kind = "video"
+                    elif ext in AUDIO_EXTS:
+                        kind = "audio"
+                    elif ext in IMAGE_EXTS:
+                        kind = "image"
+                    elif name.lower().endswith(PROJECT_EXT):
+                        kind = "project"
+                    else:
+                        continue
+                    entries["files"].append(
+                        {"name": name, "size": os.path.getsize(full), "kind": kind})
                 return self._json(entries)
             except (PermissionError, FileNotFoundError) as e:
                 return self._json({"error": str(e)}, 403)
@@ -1083,7 +1265,7 @@ def main():
     NVENC = has_nvenc()
     print(f"FFmpeg: {FFMPEG}")
     print(f"NVENC (GPU): {'disponível' if NVENC else 'indisponível — usando CPU'}")
-    print(f"EditorVideo rodando em http://localhost:{PORT}")
+    print(f"BenCut rodando em http://localhost:{PORT}")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 

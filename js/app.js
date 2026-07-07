@@ -1,4 +1,4 @@
-// EditorVideo — UI que fala com server.py (FFmpeg local)
+// BenCut — UI que fala com server.py (FFmpeg local)
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -13,7 +13,11 @@ const api = async (path, opts) => {
 // A timeline é uma lista de segmentos contíguos; "Corte" divide um segmento
 // em dois e "Deletar" marca o segmento para ficar fora da exportação.
 const state = {
-  segments: [],   // [{start, end, deleted, speed}] cobrindo o vídeo inteiro
+  segments: [],   // [{start, end, deleted, speed, volume, opacity}] cobrindo o vídeo inteiro
+  texts: [],      // [{text, start, end, pos}] em tempo VISÍVEL da timeline (= tempo do export)
+  transition: 0,  // fade preto entre trechos, em segundos (0 = sem transição)
+  audioTrack: [], // [{src, start, end, at, volume, track, hue}] áudios em N lanes
+  imageTrack: [], // [{src, at, duration, track, hue}] imagens em N lanes, default duration 3s
 };
 const history = { past: [], future: [] };
 const MAX_HISTORY = 50;
@@ -49,6 +53,9 @@ const sources = new Map();   // path -> { info, media, ready, err }
 let activeSrc = null;        // arquivo carregado no player agora
 let wantTime = 0;            // instante-alvo a buscar após trocar o src do player
 let selectedSeg = null;      // índice do segmento selecionado na timeline
+let selectedAudio = null;    // índice do clipe de áudio selecionado
+let selectedImage = null;    // índice da imagem selecionada
+let activeTrack = "video";   // faixa ativa ("video" | "audio" | "image"): Dividir/Excluir agem nela
 let nvenc = false;
 const CUT_EPS = 0.05;     // distância mínima do corte até a borda do segmento
 
@@ -66,8 +73,22 @@ const fmtTime = (s) => {
 const fmtSize = (b) => b > 1e9 ? (b / 1e9).toFixed(2) + " GB"
   : b > 1e6 ? (b / 1e6).toFixed(1) + " MB" : Math.round(b / 1e3) + " kB";
 const basename = (p) => p.split("/").pop();
+// fps do probe vem como fração ("30000/1001") → "29.97 FPS"
+const fmtFps = (fr) => {
+  const [n, d] = String(fr).split("/").map(Number);
+  const f = d ? n / d : n;
+  return Number.isFinite(f) && f > 0 ? `${+f.toFixed(2)} FPS` : "—";
+};
 const activeDur = () => activeInfo()?.duration || player.duration || 0;
-const hasContent = () => state.segments.length > 0;   // há algo na timeline?
+const hasVideo = () => state.segments.length > 0;     // há faixa de vídeo?
+// há algo na timeline (vídeo OU áudio) — o projeto pode começar só com áudio
+const hasContent = () => state.segments.length > 0 || state.audioTrack.length > 0;
+// nº de lanes de áudio = maior índice de faixa + 1 (cada áudio arrastado = +1)
+const audioLaneCount = () =>
+  state.audioTrack.reduce((m, c) => Math.max(m, (c.track || 0) + 1), 0);
+// nº de lanes de imagem (mesmo padrão)
+const imageLaneCount = () =>
+  state.imageTrack.reduce((m, c) => Math.max(m, (c.track || 0) + 1), 0);
 
 // cor própria de cada segmento: matiz gerado por ângulo áureo (cores sempre bem
 // separadas) e guardado no segmento — assim acompanha o trecho ao reordenar e
@@ -88,6 +109,16 @@ const niceStep = (target) => RULER_STEPS.find(s => s >= target) || RULER_STEPS[R
 // ---------- navegador de arquivos ----------
 let browseDir = null;
 let selectedFile = null;   // arquivo destacado por clique na lista (não carrega nada)
+let mediaFilter = "video"; // filtro do painel: "video" | "audio"
+let lastBrowse = null;     // último /api/list, p/ re-render ao trocar o filtro
+let dragKind = null;       // tipo do arquivo sendo arrastado ("video"/"audio"/"project")
+// último diretório visitado em cada aba, persistido entre sessões: ao alternar
+// Vídeo/Áudio o painel volta sozinho para onde o usuário estava naquela aba
+const dirByKind = (() => {
+  const base = { video: null, audio: null, image: null };
+  try { return { ...base, ...JSON.parse(localStorage.getItem("dirByKind")) }; }
+  catch { return base; }
+})();
 
 // clicar num arquivo o SELECIONA (destaque persistente na lista), sem enviá-lo
 // à timeline — carregar continua sendo só pelo arraste.
@@ -117,7 +148,10 @@ async function fillDurations(grid) {
 
 async function browse(dir) {
   const data = await api("/api/list?dir=" + encodeURIComponent(dir));
+  lastBrowse = data;
   browseDir = data.dir;
+  dirByKind[mediaFilter] = data.dir;    // memoriza o diretório da aba atual
+  try { localStorage.setItem("dirByKind", JSON.stringify(dirByKind)); } catch {}
   $("browser-path").textContent = data.dir.replace(/^\/home\/[^/]+/, "~");
   const ul = $("browser-list");
   ul.innerHTML = "";
@@ -136,39 +170,74 @@ async function browse(dir) {
     li.onclick = () => browse(data.dir + "/" + d);
     ul.appendChild(li);
   }
+  renderGrid();
+}
 
-  // arquivos: cards com miniatura, duração e nome
+// desenha os cards do último /api/list, filtrando pelo tipo de mídia ativo.
+// video → vídeos + projetos (.evp); audio → só áudios; image → só imagens.
+function renderGrid() {
+  const data = lastBrowse;
+  if (!data) return;
   const grid = $("browser-grid");
   grid.innerHTML = "";
-  for (const f of data.files) {
+  const files = data.files.filter(f =>
+    mediaFilter === "audio" ? f.kind === "audio"
+    : mediaFilter === "image" ? f.kind === "image"
+    : f.kind === "video" || f.kind === "project");
+  for (const f of files) {
     const full = data.dir + "/" + f.name;
-    const isProject = f.name.toLowerCase().endsWith(".evp");
+    const isProject = f.kind === "project";
+    const isAudio = f.kind === "audio";
+    const isImage = f.kind === "image";
     const card = document.createElement("div");
-    card.className = isProject ? "card project" : "card";
+    card.className = "card" + (isProject ? " project" : isAudio ? " audio" : isImage ? " image" : "");
     card.dataset.path = full;
-    card.draggable = true;             // arraste para a timeline abre o vídeo p/ edição
+    card.draggable = !isProject;
     card.title = f.name + (isProject
       ? "\nProjeto salvo — clique para retomar a edição"
+      : isAudio
+      ? "\nClique para pré-visualizar · arraste para a trilha de áudio"
+      : isImage
+      ? "\nClique para pré-visualizar · arraste para a linha de imagens"
       : "\nClique para pré-visualizar · arraste para a timeline para editar");
     if (full === selectedFile) card.classList.add("selected");
     card.innerHTML =
       `<div class="thumb"><img loading="lazy" alt=""><span class="dur"></span></div>` +
       `<div class="name">${f.name}</div><div class="size">${fmtSize(f.size)}</div>`;
     const img = card.querySelector("img");
-    img.src = isProject ? "/icons/save.svg" : "/api/thumb?path=" + encodeURIComponent(full);
+    img.src = isProject ? "/icons/save.svg"
+      : isAudio ? "/icons/audio.svg"
+      : "/api/thumb?path=" + encodeURIComponent(full);   // imagem também via ffmpeg
     img.onerror = () => img.remove();  // sem miniatura: fica o ícone de fundo
     card.addEventListener("dragstart", (e) => {
       e.dataTransfer.setData("text/plain", full);
       e.dataTransfer.effectAllowed = "copy";
+      dragKind = f.kind;      // roteia o drop (áudio → trilha; senão → vídeo)
     });
     card.onclick = () => {                   // clicar seleciona; projeto retoma a
-      selectFile(full);                      // edição, vídeo só pré-visualiza
-      isProject ? loadProject(full) : previewFile(full);
+      selectFile(full);                      // edição, mídias pré-visualizam
+      if (isProject) loadProject(full);
+      else if (isImage) previewImage(full);
+      else previewFile(full);                // vídeo e áudio
     };
     card.addEventListener("contextmenu", (e) => showFileMenu(e, full, f.name));
     grid.appendChild(card);
   }
   fillDurations(grid);
+}
+
+// toggle Vídeo/Áudio: troca o filtro e volta para o último diretório daquela
+// aba (se houver e for diferente do atual); senão só re-renderiza a lista atual
+for (const b of document.querySelectorAll(".mf-btn")) {
+  b.onclick = () => {
+    if (mediaFilter === b.dataset.kind) return;
+    mediaFilter = b.dataset.kind;
+    document.querySelectorAll(".mf-btn").forEach(x =>
+      x.classList.toggle("active", x === b));
+    const target = dirByKind[mediaFilter];
+    if (target && target !== browseDir) browse(target).catch(() => renderGrid());
+    else renderGrid();
+  };
 }
 
 // ---------- menu de contexto (botão direito nos cards) ----------
@@ -284,8 +353,9 @@ async function deleteFile(path, name) {
     rz.setPointerCapture(e.pointerId);
     rz.classList.add("dragging");
     let w = 0;
+    const railW = $("rail").offsetWidth;   // painel começa depois do rail
     const move = (ev) => {
-      w = Math.min(Math.max(ev.clientX, MIN_W), Math.round(window.innerWidth * 0.6));
+      w = Math.min(Math.max(ev.clientX - railW, MIN_W), Math.round(window.innerWidth * 0.6));
       setSideW(w);
     };
     const up = () => {
@@ -300,6 +370,86 @@ async function deleteFile(path, name) {
   rz.addEventListener("dblclick", () => {        // duplo clique restaura o padrão
     document.body.style.removeProperty("--side-w");
     localStorage.removeItem("sideWidth");
+  });
+}
+
+// rail: cada aba mostra sua view no painel lateral; clicar na aba já ativa
+// recolhe/mostra o painel inteiro
+for (const btn of document.querySelectorAll(".rail-btn")) {
+  btn.onclick = () => {
+    const wasActive = btn.classList.contains("active");
+    if (wasActive) {
+      document.body.classList.toggle("no-side");
+      return;
+    }
+    document.body.classList.remove("no-side");
+    document.querySelectorAll(".rail-btn").forEach(b => b.classList.toggle("active", b === btn));
+    document.querySelectorAll(".side-view").forEach(v =>
+      v.classList.toggle("hidden", v.id !== btn.dataset.view));
+  };
+}
+
+// painel de propriedades redimensionável pela borda esquerda (como o lateral)
+{
+  const MIN_W = 220;
+  const setW = (w) => document.body.style.setProperty("--props-w-user", w + "px");
+  const saved = parseInt(localStorage.getItem("propsWidth"), 10);
+  if (saved) setW(Math.max(MIN_W, saved));
+  const rz = $("props-resizer");
+  rz.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    rz.setPointerCapture(e.pointerId);
+    rz.classList.add("dragging");
+    let w = 0;
+    const move = (ev) => {
+      w = Math.min(Math.max(window.innerWidth - ev.clientX, MIN_W),
+                   Math.round(window.innerWidth * 0.45));
+      setW(w);
+    };
+    const up = () => {
+      rz.classList.remove("dragging");
+      rz.removeEventListener("pointermove", move);
+      rz.removeEventListener("pointerup", up);
+      if (w) localStorage.setItem("propsWidth", w);
+    };
+    rz.addEventListener("pointermove", move);
+    rz.addEventListener("pointerup", up);
+  });
+  rz.addEventListener("dblclick", () => {
+    document.body.style.removeProperty("--props-w-user");
+    localStorage.removeItem("propsWidth");
+  });
+}
+
+// painel da timeline redimensionável pela borda superior
+{
+  const MIN_H = 120;
+  const maxH = () => Math.round(window.innerHeight * 0.6);
+  const setH = (h) => document.body.style.setProperty("--bottom-h", h + "px");
+  const saved = parseInt(localStorage.getItem("bottomHeight"), 10);
+  if (saved) setH(Math.min(Math.max(saved, MIN_H), maxH()));
+  const rz = $("bottom-resizer");
+  rz.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    rz.setPointerCapture(e.pointerId);
+    rz.classList.add("dragging");
+    let h = 0;
+    const move = (ev) => {
+      h = Math.min(Math.max(window.innerHeight - ev.clientY, MIN_H), maxH());
+      setH(h);
+    };
+    const up = () => {
+      rz.classList.remove("dragging");
+      rz.removeEventListener("pointermove", move);
+      rz.removeEventListener("pointerup", up);
+      if (h) localStorage.setItem("bottomHeight", h);
+    };
+    rz.addEventListener("pointermove", move);
+    rz.addEventListener("pointerup", up);
+  });
+  rz.addEventListener("dblclick", () => {
+    document.body.style.removeProperty("--bottom-h");
+    localStorage.removeItem("bottomHeight");
   });
 }
 
@@ -396,8 +546,20 @@ async function previewFile(path) {
   const s = await ensureSource(path);
   if (!s) return;
   if (hasContent() || selectedFile !== path) return;   // situação mudou durante o await
+  $("player-wrap").classList.remove("showing-image");  // sai da prévia de imagem
   $("player-wrap").classList.add("has-video");
   switchPlayerTo(path, 0);
+}
+
+// pré-visualização de imagem: mostra o arquivo sobre a área do player (só com a
+// timeline vazia, para não sobrepor uma edição em curso). Imagens não vão para a
+// timeline por enquanto — a aba serve para navegar e visualizar.
+function previewImage(path) {
+  if (hasContent()) return;
+  $("img-preview").src = "/api/media?path=" + encodeURIComponent(path);
+  $("player-wrap").classList.remove("has-video");
+  $("player-wrap").classList.add("showing-image");
+  $("file-info").textContent = basename(path) + " — imagem (pré-visualização)";
 }
 
 async function appendOne(path) {
@@ -408,10 +570,17 @@ async function appendOne(path) {
     $("file-info").textContent = basename(path) + " — duração desconhecida, não adicionado";
     return;
   }
+  if (!s.info.video) {   // áudio puro não tem trilha própria na timeline de vídeo (ainda)
+    $("file-info").textContent = basename(path) +
+      " — arquivo de áudio ainda não pode ser adicionado à timeline de vídeo";
+    return;
+  }
   const first = state.segments.length === 0;
+  $("player-wrap").classList.remove("showing-image");
   $("player-wrap").classList.add("has-video");
+  activeTrack = "video";              // adicionar vídeo torna a faixa de vídeo ativa
   apply(st => st.segments.push(
-    { src: path, start: 0, end: dur, deleted: false, speed: 1, gap: 0, hue: nextHue() }));
+    { src: path, start: 0, end: dur, deleted: false, speed: 1, volume: 1, opacity: 1, gap: 0, hue: nextHue() }));
   if (first || !activeSrc) {           // primeiro conteúdo: carrega no player
     tlZoom = 1; tlView = 0;
     switchPlayerTo(path, 0);
@@ -521,6 +690,37 @@ let animPos = new Map();   // segKey -> início visível animado (s)
 let animDur = 0;           // duração visível animada (s)
 let layoutAnimId = null;
 
+// ---------- relógio de reprodução SEM vídeo (projeto só de áudio) ----------
+// Sem um <video> não há timeupdate para mover o playhead; um relógio próprio
+// baseado em requestAnimationFrame avança o tempo visível `noVidT`.
+let noVidT = 0;            // posição visível do playhead quando não há vídeo
+let noVidPlaying = false;
+let noVidAnchorMs = 0, noVidAnchorT = 0;
+function noVidTick() {
+  if (!noVidPlaying) return;
+  noVidT = noVidAnchorT + (performance.now() - noVidAnchorMs) / 1000;
+  if (noVidT >= timelineDur()) { noVidT = timelineDur(); noVidPlaying = false; }
+  drawTimeline();
+  if (noVidPlaying) requestAnimationFrame(noVidTick);
+}
+function noVidPlay() {
+  if (noVidT >= timelineDur() - 1e-3) noVidT = 0;   // reinicia do começo no fim
+  noVidPlaying = true;
+  noVidAnchorMs = performance.now(); noVidAnchorT = noVidT;
+  requestAnimationFrame(noVidTick);
+}
+function noVidPause() { noVidPlaying = false; drawTimeline(); }
+function noVidSeek(t) {
+  noVidT = Math.max(0, Math.min(t, timelineDur()));
+  if (noVidPlaying) { noVidAnchorMs = performance.now(); noVidAnchorT = noVidT; }
+  drawTimeline();
+}
+// controles unificados: roteiam para o <video> ou para o relógio sem-vídeo
+const isPlaying = () => hasVideo() ? !player.paused : noVidPlaying;
+function pausePlayback() { hasVideo() ? player.pause() : noVidPause(); }
+function playPlayback() { hasVideo() ? player.play() : noVidPlay(); }
+function togglePlay() { isPlaying() ? pausePlayback() : playPlayback(); }
+
 const segKey = (s) => s.src + "@" + s.start.toFixed(3) + ":" + s.end.toFixed(3);
 const keptSegs = () => state.segments.filter(s => !s.deleted);
 // duração VISÍVEL do trecho, já com a aceleração aplicada: um trecho a 2x ocupa
@@ -625,25 +825,195 @@ let panAnchorSrc = null;   // tempo-fonte a manter no centro durante a junção 
 const RULER_CSS_H = 18;                          // altura da régua (px CSS) = zona de scrub
 const TL_MIN_SPAN = 0.5;                       // menor trecho visível (s), limita o zoom in
 const TL_MIN_ZOOM = 0.2;                        // zoom out além do original (timeline encolhe)
-const tlSpan = () => animDur / tlZoom;         // segundos visíveis no viewport
-const tlMaxZoom = () => Math.max(1, animDur / TL_MIN_SPAN);
+// fim (em tempo visível) do clipe de áudio mais distante; 0 se não há trilha
+function maxAudioEnd() {
+  let m = 0;
+  for (const c of state.audioTrack) m = Math.max(m, c.at + (c.end - c.start));
+  return m;
+}
+// DURAÇÃO DO PROJETO: o maior entre a faixa de vídeo (animDur) e a trilha de
+// áudio. A régua e toda a escala se baseiam nela — cada faixa ocupa
+// (sua duração / esta) da largura, então só a mais longa preenche 100%.
+const timelineDur = () => Math.max(animDur, maxAudioEnd());
+const tlSpan = () => timelineDur() / tlZoom;   // segundos visíveis no viewport
+const tlMaxZoom = () => Math.max(1, timelineDur() / TL_MIN_SPAN);
 function clampView() {
   tlZoom = Math.max(TL_MIN_ZOOM, Math.min(tlMaxZoom(), tlZoom));
   const span = tlSpan();
+  const td = timelineDur();
   // ampliado (span<dur): faixa [0, dur-span], desloca sobre o overflow.
   // encolhido (span>dur): faixa [dur-span, 0] (negativa), desliza o bloco pelo
   // espaço vazio. exatamente encaixado: 0.
-  const lo = Math.min(0, animDur - span);
-  const hi = Math.max(0, animDur - span);
+  const lo = Math.min(0, td - span);
+  const hi = Math.max(0, td - span);
   tlView = Math.max(lo, Math.min(hi, tlView));
 }
 // dá para arrastar sempre que o conteúdo não preenche exatamente o viewport
 // (overflow com zoom in, ou espaço vazio com zoom out)
-const tlCanPan = () => Math.abs(animDur - tlSpan()) > 1e-6;
+const tlCanPan = () => Math.abs(timelineDur() - tlSpan()) > 1e-6;
 // registra o tempo-fonte que está no centro da visão, para reancorar a visão
 // enquanto a timeline se compacta (evita a visão "fugir" durante a junção)
 function capturePanAnchor() {
   panAnchorSrc = animDur > 0 ? visibleToSource(tlView + 0.5 * tlSpan()) : null;
+}
+
+// opacidade do vídeo no preview: sobre o fundo preto do player, CSS opacity
+// reproduz a fusão para preto que o export aplica via filtro
+function applyOpacity(op) {
+  const v = op >= 0.999 ? "" : String(op);
+  if (player.style.opacity !== v) player.style.opacity = v;
+}
+// aplica a opacidade do trecho sob o playhead mesmo pausado (scrub, seleção)
+function syncScrubFx() {
+  const i = keptIdxAt(activeSrc, player.currentTime);
+  applyOpacity(i >= 0 ? (state.segments[i].opacity ?? 1) : 1);
+}
+
+// mostra os textos ativos no tempo visível vt sobre o player, espelhando o
+// export: mesma âncora (h/12), mesma escala de fonte (altura/14) e fundo
+function updateTextOverlay(vt) {
+  const ov = $("text-overlay");
+  const active = vt == null ? [] : state.texts.filter(t => vt >= t.start && vt <= t.end);
+  if (!active.length) { if (ov.firstChild) ov.textContent = ""; return; }
+  const fs = Math.max(10, $("player-wrap").clientHeight / 14);
+  // reconstrução simples: são pouquíssimos nós e só quando há texto ativo
+  ov.textContent = "";
+  for (const t of active) {
+    const d = document.createElement("div");
+    d.className = "tx pos-" + (t.pos || "bottom");
+    d.style.fontSize = fs + "px";
+    d.textContent = t.text;
+    ov.appendChild(d);
+  }
+}
+
+// índice do clipe de áudio da lane `lane` no tempo visível vt (-1 se nenhum)
+function audioIdxAtVisible(vt, lane) {
+  for (let i = 0; i < state.audioTrack.length; i++) {
+    const c = state.audioTrack[i];
+    if ((c.track || 0) === lane && vt >= c.at && vt <= c.at + (c.end - c.start)) return i;
+  }
+  return -1;
+}
+
+// encaixe magnético: ao arrastar o clipe `movingIdx` para a posição `at`, se
+// uma de suas bordas chegar a menos de SNAP_PX px da borda de outro clipe (ou
+// do início 0), encosta exatamente nela. Devolve o `at` ajustado.
+const SNAP_PX = 8;
+function snapAudioAt(at, movingIdx) {
+  const c = state.audioTrack[movingIdx];
+  const len = c.end - c.start;
+  const thresh = SNAP_PX * (tlSpan() / Math.max(1, canvas.clientWidth));  // px → s
+  const targets = [0];                              // início da timeline
+  state.audioTrack.forEach((o, j) => {              // só encaixa em clipes da MESMA lane
+    if (j !== movingIdx && (o.track || 0) === (c.track || 0))
+      targets.push(o.at, o.at + (o.end - o.start));
+  });
+  let bestAt = at, bestDist = thresh;
+  for (const t of targets) {
+    let d = Math.abs(at - t);                        // borda esquerda encosta em t
+    if (d < bestDist) { bestDist = d; bestAt = t; }
+    d = Math.abs((at + len) - t);                    // borda direita encosta em t
+    if (d < bestDist) { bestDist = d; bestAt = t - len; }
+  }
+  return Math.max(0, bestAt);
+}
+
+// pool de elementos <audio>, um por lane (várias trilhas tocam simultâneas)
+const audioEls = [];
+function audioEl(lane) {
+  if (!audioEls[lane]) {
+    const a = document.createElement("audio");
+    a.style.display = "none";
+    document.body.appendChild(a);
+    audioEls[lane] = a;
+  }
+  return audioEls[lane];
+}
+function pauseAllAudioEls() { for (const a of audioEls) if (a && !a.paused) a.pause(); }
+
+// ---------- trilhas de imagem ──
+// topo (px CSS) da área de mídia (áudio + imagem)
+const mediaAreaTopCss = () => canvas.clientHeight - (audioLaneCount() + imageLaneCount()) * AUDIO_LANE_CSS_H;
+// ponteiro está na área das lanes de mídia (áudio + imagem)?
+const inMediaLane = (e) => (audioLaneCount() + imageLaneCount()) > 0 &&
+  (e.clientY - canvas.getBoundingClientRect().top) >= mediaAreaTopCss();
+// índice da lane (0..nAudio-1=áudio, nAudio..=imagem) sob o ponteiro
+function mediaLaneAt(e) {
+  const y = e.clientY - canvas.getBoundingClientRect().top - mediaAreaTopCss();
+  return Math.max(0, Math.min(audioLaneCount() + imageLaneCount() - 1, Math.floor(y / AUDIO_LANE_CSS_H)));
+}
+// índice da imagem da lane `lane` no tempo visível vt (-1 se nenhuma)
+function imageIdxAtVisible(vt, lane) {
+  for (let i = 0; i < state.imageTrack.length; i++) {
+    const c = state.imageTrack[i];
+    if ((c.track || 0) === lane && vt >= c.at && vt <= c.at + c.duration) return i;
+  }
+  return -1;
+}
+
+// adiciona um arquivo de imagem na posição visível `at`; cada arquivo entra numa FAIXA própria
+async function addImageClip(path, at) {
+  const s = await ensureSource(path);
+  if (!s) return;
+  const pos = Math.max(0, at ?? 0);
+  const lane = imageLaneCount();       // nova lane para esta imagem
+  const dur = 3;                       // duração padrão: 3 segundos
+  const firstMedia = !hasContent();
+  apply(st => st.imageTrack.push({ src: path, at: pos, duration: dur, track: lane, hue: nextHue() }));
+  selectedImage = state.imageTrack.length - 1;
+  selectedSeg = null;
+  selectedAudio = null;
+  activeTrack = "image";
+  if (firstMedia) { tlZoom = 1; tlView = 0; }
+  renderState();
+}
+
+// mantém cada lane de áudio em sincronia com o playhead visível: em cada lane,
+// toca o clipe ativo na posição certa. Espelha a mixagem que o export faz.
+function syncAudioTrack(playVis) {
+  const playing = gapHold != null ? true : isPlaying();
+  const nAudio = audioLaneCount();
+  for (let lane = 0; lane < nAudio; lane++) {
+    const a = audioEl(lane);
+    const c = playVis == null ? null : state.audioTrack.find(c =>
+      (c.track || 0) === lane && playVis >= c.at && playVis < c.at + (c.end - c.start));
+    if (!c) { if (!a.paused) a.pause(); continue; }
+    if (a.dataset.src !== c.src) {
+      a.src = "/api/media?path=" + encodeURIComponent(c.src);
+      a.dataset.src = c.src;
+    }
+    a.volume = c.volume ?? 1;
+    const want = c.start + (playVis - c.at);
+    if (playing) {
+      if (a.paused) a.play().catch(() => {});
+      if (Math.abs(a.currentTime - want) > 0.3) { try { a.currentTime = want; } catch {} }
+    } else {
+      if (!a.paused) a.pause();
+      if (Math.abs(a.currentTime - want) > 0.05) { try { a.currentTime = want; } catch {} }
+    }
+  }
+  for (let lane = nAudio; lane < audioEls.length; lane++)
+    if (audioEls[lane] && !audioEls[lane].paused) audioEls[lane].pause();
+}
+
+// adiciona um arquivo de áudio na posição visível `at`; cada arquivo arrastado
+// entra numa FAIXA (lane) própria — não exige vídeo (pode iniciar o projeto)
+async function addAudioClip(path, at) {
+  const s = await ensureSource(path);
+  if (!s) return;
+  const dur = s.info.duration || 0;
+  if (dur <= 0) return;
+  const pos = Math.max(0, at ?? 0);           // livre; pode ser a mídia mais longa
+  const lane = audioLaneCount();              // nova lane para este arquivo
+  const firstMedia = !hasContent();
+  apply(st => st.audioTrack.push(
+    { src: path, start: 0, end: dur, at: pos, volume: 1, track: lane, hue: nextHue() }));
+  selectedAudio = state.audioTrack.length - 1;
+  selectedSeg = null;
+  activeTrack = "audio";        // trabalhar no áudio recém-adicionado
+  if (firstMedia) { tlZoom = 1; tlView = 0; }  // 1ª mídia: reancora a visão
+  renderState();
 }
 
 function drawTimeline() {
@@ -651,19 +1021,24 @@ function drawTimeline() {
   const w = canvas.width = canvas.clientWidth * dpr;
   const h = canvas.height = canvas.clientHeight * dpr;
   ctx.clearRect(0, 0, w, h);
-  if (!hasContent() || animDur <= 0) return;
+  if (timelineDur() <= 0) { updateTextOverlay(null); applyOpacity(1); return; }
   const kept = keptSegs();
-  if (!kept.length) return;
   clampView();
-  const scale = (w * tlZoom) / animDur;      // px por segundo (amplia com o zoom)
+  const scale = (w * tlZoom) / timelineDur(); // px por segundo (base = maior mídia)
   const sx = (vt) => (vt - tlView) * scale;  // tempo visível → x na tela (com pan)
 
-  // faixa reservada no topo para a régua de tempo (também é a zona de scrub)
+  // geometria: régua no topo, faixa de vídeo (se houver) no meio, lanes de
+  // áudio+imagem empilhadas embaixo (uma por arquivo arrastado)
   const rulerH = RULER_CSS_H * dpr;
-  const segTop = rulerH, segH = h - rulerH;
+  const nAudio = audioLaneCount();
+  const nImage = imageLaneCount();
+  const mediaLaneH = AUDIO_LANE_CSS_H * dpr;
+  const mediaAreaTop = h - (nAudio + nImage) * mediaLaneH;
+  const hasVid = kept.length > 0;
+  const segTop = rulerH, segH = Math.max(0, mediaAreaTop - 4 * dpr - rulerH);
 
   let prevVisEnd = 0;
-  for (const s of kept) {
+  for (const s of (hasVid ? kept : [])) {
     const i = state.segments.indexOf(s);
     const visStart = animPos.get(segKey(s)) ?? 0;
     // lacuna preta antes deste trecho (espaço criado ao afastá-lo)
@@ -700,12 +1075,70 @@ function drawTimeline() {
     prevVisEnd = visStart + segVis(s);
   }
 
+  // ── lanes de áudio e imagem (embaixo), uma por faixa ──
+  const audioActive = activeTrack === "audio";
+  const imageActive = activeTrack === "image";
+  // fundo das lanes
+  for (let li = 0; li < nAudio + nImage; li++) {
+    const laneTop = mediaAreaTop + li * mediaLaneH;
+    const isAudioLane = li < nAudio;
+    const isActive = isAudioLane ? audioActive : imageActive;
+    ctx.fillStyle = isActive ? "rgba(122,92,240,.12)" : "rgba(255,255,255,.035)";
+    ctx.fillRect(0, laneTop, w, mediaLaneH);
+    ctx.fillStyle = isActive ? "#7a5cf0" : "rgba(255,255,255,.14)";
+    ctx.fillRect(0, laneTop, w, (isActive ? 2 : 1) * dpr);
+  }
+  // clipes de áudio
+  for (let i = 0; i < state.audioTrack.length; i++) {
+    const c = state.audioTrack[i];
+    const laneTop = mediaAreaTop + (c.track || 0) * mediaLaneH;
+    const x0 = sx(c.at), wd = (c.end - c.start) * scale;
+    const sel = i === selectedAudio;
+    const hue = c.hue ?? 158;
+    ctx.fillStyle = `hsla(${hue}, 60%, 45%, ${sel ? 0.92 : 0.62})`;
+    ctx.fillRect(x0, laneTop + 3 * dpr, wd, mediaLaneH - 6 * dpr);
+    if (sel) {
+      ctx.strokeStyle = "rgba(255,255,255,.92)"; ctx.lineWidth = 2 * dpr;
+      ctx.strokeRect(x0 + 1, laneTop + 3 * dpr + 1, wd - 2, mediaLaneH - 6 * dpr - 2);
+    }
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x0, laneTop, wd, mediaLaneH); ctx.clip();
+    ctx.fillStyle = "#eafff6"; ctx.font = `${9.5 * dpr}px system-ui, sans-serif`;
+    ctx.textBaseline = "middle";
+    ctx.fillText("🎵 " + basename(c.src), x0 + 5 * dpr, laneTop + mediaLaneH / 2);
+    ctx.restore();
+  }
+  // clipes de imagem
+  for (let i = 0; i < state.imageTrack.length; i++) {
+    const c = state.imageTrack[i];
+    const laneTop = mediaAreaTop + (nAudio + (c.track || 0)) * mediaLaneH;
+    const x0 = sx(c.at), wd = c.duration * scale;
+    const sel = i === selectedImage;
+    const hue = c.hue ?? 45;
+    ctx.fillStyle = `hsla(${hue}, 70%, 55%, ${sel ? 0.92 : 0.62})`;
+    ctx.fillRect(x0, laneTop + 3 * dpr, wd, mediaLaneH - 6 * dpr);
+    if (sel) {
+      ctx.strokeStyle = "rgba(255,255,255,.92)"; ctx.lineWidth = 2 * dpr;
+      ctx.strokeRect(x0 + 1, laneTop + 3 * dpr + 1, wd - 2, mediaLaneH - 6 * dpr - 2);
+    }
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x0, laneTop, wd, mediaLaneH); ctx.clip();
+    ctx.fillStyle = "#fffaed"; ctx.font = `${9.5 * dpr}px system-ui, sans-serif`;
+    ctx.textBaseline = "middle";
+    ctx.fillText("🖼 " + basename(c.src), x0 + 5 * dpr, laneTop + mediaLaneH / 2);
+    ctx.restore();
+  }
+
   drawRuler(w, h, rulerH, scale);
 
-  // cursor de reprodução (posição compactada; numa lacuna usa o playhead virtual)
-  const playVis = gapVisible != null ? gapVisible : sourceToVisible(activeSrc, player.currentTime);
+  // cursor de reprodução: com vídeo segue o <video>; sem vídeo, o relógio próprio
+  const playVis = gapVisible != null ? gapVisible
+    : hasVid ? sourceToVisible(activeSrc, player.currentTime) : noVidT;
+  updateTextOverlay(playVis);           // textos do preview seguem o playhead
+  syncScrubFx();                        // opacidade também vale parado/no scrub
+  syncAudioTrack(playVis);              // trilha de áudio segue o playhead
   const cx = sx(playVis);
-  ctx.fillStyle = "#e87f0a";
+  ctx.fillStyle = "#b7a8ff";
   ctx.fillRect(cx - 1, 0, 3, h);
 
   // tempo exato do playhead junto ao cursor (troca de lado perto da borda)
@@ -718,7 +1151,7 @@ function drawTimeline() {
   const left = cx + tw + pad * 3 > w ? cx - tw - pad * 3 : cx + pad;
   ctx.fillStyle = "rgba(20,20,20,.85)";
   ctx.fillRect(left, boxTop, tw + pad * 2, boxH);
-  ctx.fillStyle = "#e87f0a";
+  ctx.fillStyle = "#b7a8ff";
   ctx.textBaseline = "middle";
   ctx.fillText(label, left + pad, boxTop + boxH / 2);
 }
@@ -740,7 +1173,7 @@ function drawRuler(w, h, rulerH, scale) {
   ctx.font = `${10 * dpr}px system-ui, sans-serif`;
   ctx.textBaseline = "middle";
   // não passa do fim real da timeline (com zoom out há espaço vazio à direita)
-  const tEnd = Math.min(tlView + span, animDur);
+  const tEnd = Math.min(tlView + span, timelineDur());
   for (let t = Math.max(0, Math.ceil(tlView / step) * step); t <= tEnd + 1e-6; t += step) {
     const x = (t - tlView) * scale;
     ctx.fillStyle = "rgba(255,255,255,.25)";
@@ -759,6 +1192,11 @@ function drawRuler(w, h, rulerH, scale) {
 let scrubbing = false, wasPlaying = false, pendingSeek = null;
 // arraste de um segmento SELECIONADO para afastá-lo (criar/ajustar lacuna preta)
 let segMoving = false, segMoveIdx = -1, segMoveOrigGap = 0, segMoveSpan0 = 0, segMoveHist = false;
+// arraste de clipe de áudio na lane inferior (muda só o campo `at`)
+let audioMoving = false, audioMoveIdx = -1, audioMoveBaseX = 0, audioMoveOrigAt = 0, audioMoveHist = false;
+// arraste de clipe de imagem na lane (muda só o campo `at`)
+let imageMoving = false, imageMoveIdx = -1, imageMoveBaseX = 0, imageMoveOrigAt = 0, imageMoveHist = false;
+const AUDIO_LANE_CSS_H = 34;   // altura da lane de áudio em px CSS
 let segMoveNextIdx = -1, segMoveOrigNextGap = 0;   // próximo trecho mantido e sua lacuna
 let segMoveBaseX = 0;   // clientX de referência do arraste (re-ancorado a cada troca de ordem)
 
@@ -796,6 +1234,7 @@ function seekSource(src, t) {
 // raspagem ciente de lacuna: se o ponteiro cai numa lacuna, mostra preto e
 // estaciona o vídeo no início do próximo trecho (frame atrás do overlay).
 function scrubToVisible(vt) {
+  if (!hasVideo()) { noVidSeek(vt); return; }   // sem vídeo: só move o relógio
   const inGap = visibleGapAt(vt);
   gapVisible = inGap ? vt : null;
   setGapOverlay(inGap);
@@ -838,6 +1277,7 @@ function segIndexAtVisible(vt) {
 function selectSegAt(src, t) {
   const i = state.segments.findIndex(s => !s.deleted && s.src === src && t >= s.start && t <= s.end);
   selectedSeg = i >= 0 ? i : null;
+  selectedAudio = null;                // selecionar vídeo desmarca o clipe de áudio
 }
 function seekAndSelect(e) {
   const vt = visibleAtEvent(e);
@@ -859,10 +1299,48 @@ onPlayerEvent("seeked", () => {
 const onRuler = (e) => (e.clientY - canvas.getBoundingClientRect().top) < RULER_CSS_H;
 
 canvas.addEventListener("pointerdown", (e) => {
-  if (!hasContent() || animDur <= 0) return;
+  if (timelineDur() <= 0) return;
   canvas.setPointerCapture(e.pointerId);
   downX = e.clientX;
   dragMoved = false;
+  // lanes de áudio+imagem: descubra qual tipo pela posição dentro da área de mídia
+  if (inMediaLane(e)) {
+    const lane = mediaLaneAt(e);
+    const nAudio = audioLaneCount();
+    // lane < nAudio = áudio, senão = imagem
+    if (lane < nAudio) {
+      activeTrack = "audio";
+      const ai = audioIdxAtVisible(visibleAtEvent(e), lane);
+      if (ai !== -1) {
+        audioMoving = true; audioMoveIdx = ai; audioMoveBaseX = e.clientX;
+        audioMoveOrigAt = state.audioTrack[ai].at; audioMoveHist = false;
+        selectedAudio = ai; selectedSeg = null; selectedImage = null;
+        canvas.style.cursor = "grabbing";
+        renderState();
+        return;
+      }
+      selectedAudio = null; selectedSeg = null; selectedImage = null;
+      scrubbing = true; wasPlaying = isPlaying(); pausePlayback();
+      scrubToVisible(visibleAtEvent(e)); renderState();
+      return;
+    } else {
+      activeTrack = "image";
+      const ii = imageIdxAtVisible(visibleAtEvent(e), lane - nAudio);
+      if (ii !== -1) {
+        imageMoving = true; imageMoveIdx = ii; imageMoveBaseX = e.clientX;
+        imageMoveOrigAt = state.imageTrack[ii].at; imageMoveHist = false;
+        selectedImage = ii; selectedSeg = null; selectedAudio = null;
+        canvas.style.cursor = "grabbing";
+        renderState();
+        return;
+      }
+      selectedImage = null; selectedSeg = null; selectedAudio = null;
+      scrubbing = true; wasPlaying = isPlaying(); pausePlayback();
+      scrubToVisible(visibleAtEvent(e)); renderState();
+      return;
+    }
+  }
+  activeTrack = "video";
   const overIdx = onRuler(e) ? -1 : segIndexAtVisible(visibleAtEvent(e));
   if (overIdx !== -1 && overIdx === selectedSeg) {
     // arrastar o segmento SELECIONADO → desliza na lacuna preta e, ao passar
@@ -883,13 +1361,52 @@ canvas.addEventListener("pointerdown", (e) => {
     canvas.style.cursor = "grabbing";
   } else {
     scrubbing = true;
-    wasPlaying = !player.paused;
-    player.pause();
+    wasPlaying = isPlaying();
+    pausePlayback();
     seekAndSelect(e);
   }
 });
 canvas.addEventListener("pointermove", (e) => {
+  if (audioMoving) {
+    if (Math.abs(e.clientX - downX) > 3) dragMoved = true;
+    if (dragMoved && !audioMoveHist) {   // 1ª movimentação: 1 passo de undo
+      history.past.push(JSON.stringify(state));
+      if (history.past.length > MAX_HISTORY) history.past.shift();
+      history.future = []; audioMoveHist = true;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const dSec = (e.clientX - audioMoveBaseX) / rect.width * tlSpan();
+    const c = state.audioTrack[audioMoveIdx];
+    c.at = snapAudioAt(Math.max(0, audioMoveOrigAt + dSec), audioMoveIdx);
+    clampView();
+    drawTimeline();
+    return;
+  }
+  if (imageMoving) {
+    if (Math.abs(e.clientX - downX) > 3) dragMoved = true;
+    if (dragMoved && !imageMoveHist) {   // 1ª movimentação: 1 passo de undo
+      history.past.push(JSON.stringify(state));
+      if (history.past.length > MAX_HISTORY) history.past.shift();
+      history.future = []; imageMoveHist = true;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const dSec = (e.clientX - imageMoveBaseX) / rect.width * tlSpan();
+    const c = state.imageTrack[imageMoveIdx];
+    c.at = Math.max(0, imageMoveOrigAt + dSec);
+    clampView();
+    drawTimeline();
+    return;
+  }
   if (!panning && !scrubbing && !segMoving) {   // hover: cursor por zona
+    if (inMediaLane(e)) {
+      const lane = mediaLaneAt(e);
+      const nAudio = audioLaneCount();
+      const hasItem = lane < nAudio
+        ? audioIdxAtVisible(visibleAtEvent(e), lane) !== -1
+        : imageIdxAtVisible(visibleAtEvent(e), lane - nAudio) !== -1;
+      canvas.style.cursor = hasItem ? "grab" : "crosshair";
+      return;
+    }
     const overSel = !onRuler(e) && selectedSeg != null
       && segIndexAtVisible(visibleAtEvent(e)) === selectedSeg;
     canvas.style.cursor = onRuler(e) ? "ew-resize"
@@ -944,7 +1461,7 @@ canvas.addEventListener("pointermove", (e) => {
     animPos = new Map(tl.pos); animDur = tl.dur;
     // ESCALA FIXA: a régua não recomprime; a timeline só estica e o segmento
     // desliza acompanhando o cursor (o restante além da largura vê-se com pan/zoom).
-    tlZoom = animDur / segMoveSpan0;
+    tlZoom = timelineDur() / segMoveSpan0;
     clampView();
     drawTimeline();
   } else if (panning) {
@@ -958,6 +1475,18 @@ canvas.addEventListener("pointermove", (e) => {
   }
 });
 canvas.addEventListener("pointerup", (e) => {
+  if (audioMoving) {
+    audioMoving = false;
+    canvas.style.cursor = "grab";
+    if (dragMoved) renderState();
+    return;
+  }
+  if (imageMoving) {
+    imageMoving = false;
+    canvas.style.cursor = "grab";
+    if (dragMoved) renderState();
+    return;
+  }
   if (segMoving) {
     segMoving = false;
     canvas.style.cursor = "move";
@@ -970,13 +1499,13 @@ canvas.addEventListener("pointerup", (e) => {
   } else if (scrubbing) {
     scrubbing = false;
     pendingSeek = null;
-    if (wasPlaying) player.play();
+    if (wasPlaying) playPlayback();
   }
 });
 
 // roda do mouse amplia/reduz mantendo o ponto sob o cursor fixo
 canvas.addEventListener("wheel", (e) => {
-  if (!hasContent() || animDur <= 0) return;
+  if (timelineDur() <= 0) return;
   e.preventDefault();
   const rect = canvas.getBoundingClientRect();
   const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
@@ -1006,8 +1535,15 @@ dropZone.addEventListener("drop", (e) => {
   e.preventDefault();
   canvas.classList.remove("drag-over");
   const path = e.dataTransfer.getData("text/plain");
+  const kind = dragKind; dragKind = null;
   if (!path) return;
-  path.toLowerCase().endsWith(".evp") ? loadProject(path) : addToTimeline(path);
+  if (path.toLowerCase().endsWith(".evp")) return loadProject(path);
+  const rect = canvas.getBoundingClientRect();
+  const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const at = timelineDur() > 0 ? tlView + frac * tlSpan() : 0;
+  if (kind === "audio") return addAudioClip(path, at);
+  if (kind === "image") return addImageClip(path, at);
+  addToTimeline(path);
 });
 
 // Durante a reprodução: pula os trechos deletados e, ao entrar num trecho que
@@ -1036,6 +1572,9 @@ function advancePlayback() {
   const seg = state.segments[idx];
   const rate = seg.speed || 1;          // preview honra a aceleração do trecho tocado
   if (player.playbackRate !== rate) player.playbackRate = rate;
+  const vol = seg.volume ?? 1;          // …e o volume por segmento
+  if (player.volume !== vol) player.volume = vol;
+  applyOpacity(seg.opacity ?? 1);       // fusão para preto (fundo do player é preto)
   if (t >= seg.end - 0.05) {
     const nxt = nextKeptAfter(seg);
     if (nxt && nxt.src !== activeSrc) goToKept(nxt);
@@ -1081,7 +1620,14 @@ onPlayerEvent("ended", () => {
 });
 
 // ---------- corte / deleção / exportação ----------
+// tempo VISÍVEL do playhead (compactado; numa lacuna usa o playhead virtual;
+// sem vídeo, o relógio próprio)
+const currentVis = () =>
+  gapVisible != null ? gapVisible
+  : hasVideo() ? sourceToVisible(activeSrc, player.currentTime) : noVidT;
+
 function doCut() {
+  if (activeTrack === "audio") return doCutAudio();
   const t = player.currentTime;   // o playhead está sempre dentro do arquivo ativo
   const i = state.segments.findIndex(s =>
     s.src === activeSrc && !s.deleted && t > s.start + CUT_EPS && t < s.end - CUT_EPS);
@@ -1090,11 +1636,41 @@ function doCut() {
   apply(s => {
     const seg = s.segments[i];
     s.segments.splice(i, 1,
-      { src: seg.src, start: seg.start, end: t, deleted: seg.deleted, speed: seg.speed, gap: seg.gap || 0, hue: seg.hue },
-      { src: seg.src, start: t, end: seg.end, deleted: seg.deleted, speed: seg.speed, gap: 0, hue: nextHue() });
+      { ...seg, end: t, gap: seg.gap || 0 },
+      { ...seg, start: t, gap: 0, hue: nextHue() });
+  });
+}
+// divide o clipe de áudio sob o playhead em dois (áudio a 1x: offset visível =
+// offset na fonte, então o ponto de corte na fonte é start + (vt - at))
+function doCutAudio() {
+  const vt = currentVis();
+  const i = state.audioTrack.findIndex(c =>
+    vt > c.at + CUT_EPS && vt < c.at + (c.end - c.start) - CUT_EPS);
+  if (i < 0) return;
+  const c = state.audioTrack[i];
+  const cut = c.start + (vt - c.at);
+  selectedAudio = null;
+  apply(s => {
+    s.audioTrack.splice(i, 1,
+      { ...c, end: cut },
+      { ...c, start: cut, at: vt, hue: nextHue() });   // metade nova ganha cor própria
   });
 }
 function deleteSelected() {
+  if (activeTrack === "image") {        // Excluir age só na faixa de imagem
+    if (selectedImage == null) return;
+    const i = selectedImage;
+    selectedImage = null;
+    apply(s => s.imageTrack.splice(i, 1));
+    return;
+  }
+  if (activeTrack === "audio") {        // Excluir age só na faixa de áudio
+    if (selectedAudio == null) return;
+    const i = selectedAudio;
+    selectedAudio = null;
+    apply(s => s.audioTrack.splice(i, 1));
+    return;
+  }
   if (selectedSeg == null || state.segments[selectedSeg]?.deleted) return;
   const i = selectedSeg;
   selectedSeg = null;
@@ -1109,8 +1685,18 @@ function deleteSelected() {
 // está (um refresh de verdade voltaria à pasta inicial, mais atrapalha que ajuda).
 function resetEditor() {
   state.segments = [];
+  state.texts = [];
+  state.transition = 0;
+  state.audioTrack = [];
+  state.imageTrack = [];
+  pauseAllAudioEls();
+  for (const a of audioEls) if (a) { a.removeAttribute("src"); delete a.dataset.src; }
+  noVidPlaying = false; noVidT = 0;
   history.past = []; history.future = [];
   selectedSeg = null;
+  selectedAudio = null;
+  selectedImage = null;
+  activeTrack = "video";
   activeSrc = null; wantTime = 0;
   sources.clear();
   tlZoom = 1; tlView = 0;
@@ -1132,7 +1718,104 @@ function setSpeedSelected() {
 
 $("btn-cut").onclick = doCut;
 $("btn-del-seg").onclick = deleteSelected;
+
+// sliders de ajuste: arrastar dá preview ao vivo; soltar grava no estado (undo)
+const withSelected = (fn) => {
+  if (selectedSeg == null || state.segments[selectedSeg]?.deleted) return;
+  fn(selectedSeg);
+};
+$("seg-speed").oninput = () => {
+  const sp = parseFloat($("seg-speed").value);
+  $("seg-speed-val").textContent = sp + "x";
+  player.playbackRate = sp;                    // sensação imediata do ajuste
+};
 $("seg-speed").onchange = setSpeedSelected;
+$("seg-vol").oninput = () => {
+  $("seg-vol-val").textContent = $("seg-vol").value + "%";
+  const v = $("seg-vol").value / 100;
+  // audição imediata: no clipe de áudio ajusta o <audio> da lane, senão o player
+  if (selectedAudio != null) audioEl(state.audioTrack[selectedAudio].track || 0).volume = v;
+  else player.volume = v;
+};
+$("seg-vol").onchange = () => {
+  if (selectedImage != null) {
+    const i = selectedImage;
+    const dur = parseFloat($("seg-vol").value) / 10;
+    apply(s => { s.imageTrack[i].duration = dur; });
+    return;
+  }
+  const v = parseInt($("seg-vol").value, 10) / 100;
+  if (selectedAudio != null) {
+    const i = selectedAudio;
+    apply(s => { s.audioTrack[i].volume = v; });
+    return;
+  }
+  withSelected(i => apply(s => { s.segments[i].volume = v; }));
+};
+$("seg-op").oninput = () => {
+  $("seg-op-val").textContent = $("seg-op").value + "%";
+  applyOpacity($("seg-op").value / 100);       // visão imediata do ajuste
+};
+$("seg-op").onchange = () => withSelected(i => {
+  const v = parseInt($("seg-op").value, 10) / 100;
+  apply(s => { s.segments[i].opacity = v; });
+});
+$("btn-reset-adjust").onclick = () => withSelected(i => {
+  apply(s => Object.assign(s.segments[i], { speed: 1, volume: 1, opacity: 1 }));
+});
+
+// ---------- textos sobre o vídeo ----------
+$("btn-add-text").onclick = () => {
+  if (!hasVideo()) { alert("Adicione um vídeo à timeline primeiro."); return; }
+  const vt = sourceToVisible(activeSrc, player.currentTime);
+  apply(s => s.texts.push({
+    text: "Seu texto aqui",
+    start: Math.round(vt * 10) / 10,
+    end: Math.round(Math.min(vt + 3, animDur) * 10) / 10,
+    pos: "bottom",
+  }));
+};
+
+// lista de textos no painel: campos commitam no change (blur), com undo
+function renderTexts() {
+  const ul = $("texts-list");
+  ul.textContent = "";
+  state.texts.forEach((t, i) => {
+    const li = document.createElement("li");
+    const txt = document.createElement("input");
+    txt.className = "t-text"; txt.value = t.text; txt.placeholder = "Texto…";
+    txt.onchange = () => apply(s => { s.texts[i].text = txt.value; });
+    const row = document.createElement("div");
+    row.className = "t-row";
+    const mkNum = (val, set) => {
+      const n = document.createElement("input");
+      n.type = "number"; n.step = "0.1"; n.min = "0"; n.value = val;
+      n.onchange = () => apply(s => set(s.texts[i], Math.max(0, parseFloat(n.value) || 0)));
+      return n;
+    };
+    const start = mkNum(t.start, (o, v) => { o.start = v; });
+    const end = mkNum(t.end, (o, v) => { o.end = v; });
+    const pos = document.createElement("select");
+    for (const [v, label] of [["top", "Topo"], ["center", "Centro"], ["bottom", "Base"]]) {
+      const op = document.createElement("option");
+      op.value = v; op.textContent = label; op.selected = (t.pos || "bottom") === v;
+      pos.appendChild(op);
+    }
+    pos.onchange = () => apply(s => { s.texts[i].pos = pos.value; });
+    const rm = document.createElement("button");
+    rm.className = "rm"; rm.textContent = "✕"; rm.title = "Remover texto";
+    rm.onclick = () => apply(s => s.texts.splice(i, 1));
+    row.append(start, document.createTextNode("→"), end, pos, rm);
+    li.append(txt, row);
+    ul.appendChild(li);
+  });
+}
+
+// ---------- transição (fade preto nas emendas, aplicado na exportação) ----------
+$("trans-dur").onchange = () => {
+  const d = parseFloat($("trans-dur").value) || 0;
+  apply(s => { s.transition = d; });
+};
 // Detecta o formato do arquivo original
 function getOriginalFormat() {
   if (!activeSrc) return "";
@@ -1150,13 +1833,16 @@ $("btn-export").onclick = () => {
 };
 // salvar PROJETO (.evp): grava os segmentos da timeline em JSON para retomar depois
 $("btn-save").onclick = async () => {
-  if (!state.segments.length) return;
+  if (!hasContent()) return;
+  const refSrc = (state.segments[0] || state.audioTrack[0]).src;
   try {
-    const picked = await api("/api/pick-save?input=" + encodeURIComponent(state.segments[0].src) +
+    const picked = await api("/api/pick-save?input=" + encodeURIComponent(refSrc) +
       "&suffix=projeto&ext=evp&title=" + encodeURIComponent("Salvar projeto"));
     if (picked.cancelled) return;
-    const project = { app: "EditorVideo", version: 1, savedAt: new Date().toISOString(),
-                      segments: state.segments };
+    const project = { app: "BenCut", version: 4, savedAt: new Date().toISOString(),
+                      segments: state.segments, texts: state.texts,
+                      transition: state.transition || 0, audioTrack: state.audioTrack,
+                      imageTrack: state.imageTrack };
     const r = await api("/api/project-save", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: picked.path, project }),
@@ -1170,7 +1856,7 @@ $("btn-save").onclick = async () => {
 $("btn-open").onclick = async () => {
   try {
     const picked = await api("/api/pick-open?title=" + encodeURIComponent("Abrir projeto") +
-      "&filter=" + encodeURIComponent("Projetos EditorVideo (*.evp) | *.evp"));
+      "&filter=" + encodeURIComponent("Projetos BenCut (*.evp) | *.evp"));
     if (picked.cancelled) return;
     loadProject(picked.path);
   } catch (e) { alert("Erro ao abrir projeto: " + e.message); }
@@ -1185,33 +1871,77 @@ async function loadProject(path) {
     proj = await api("/api/project-load?path=" + encodeURIComponent(path));
   } catch (e) { alert("Erro ao abrir projeto: " + e.message); return; }
   const segs = proj.segments || [];
-  if (!segs.length) { alert("Projeto vazio."); return; }
+  const audioTrack = proj.audioTrack || [];
+  const imageTrack = proj.imageTrack || [];
+  if (!segs.length && !audioTrack.length && !imageTrack.length) { alert("Projeto vazio."); return; }
   const missing = [];
-  for (const src of [...new Set(segs.map(s => s.src))]) {
+  for (const src of [...new Set([...segs.map(s => s.src), ...audioTrack.map(c => c.src), ...imageTrack.map(c => c.src)])]) {
     if (!await ensureSource(src)) missing.push(src);
   }
   if (missing.length) {
     alert("Arquivos do projeto não encontrados:\n" + missing.join("\n"));
     return;
   }
-  apply(st => { st.segments = segs; });   // entra no histórico (dá para desfazer)
+  apply(st => {                           // entra no histórico (dá para desfazer)
+    st.segments = segs;
+    st.texts = proj.texts || [];
+    st.transition = proj.transition || 0;
+    st.audioTrack = audioTrack;
+    st.imageTrack = imageTrack;
+  });
   selectedSeg = null;
+  selectedAudio = null;
+  selectedImage = null;
+  activeTrack = segs.length ? "video" : (audioTrack.length ? "audio" : "image");
+  noVidPlaying = false; noVidT = 0;
   tlZoom = 1; tlView = 0;
-  const first = segs.find(s => !s.deleted) || segs[0];
-  $("player-wrap").classList.add("has-video");
-  switchPlayerTo(first.src, first.start);
+  $("player-wrap").classList.remove("showing-image");
+  if (segs.length) {                          // projeto com vídeo: carrega no player
+    const first = segs.find(s => !s.deleted) || segs[0];
+    $("player-wrap").classList.add("has-video");
+    switchPlayerTo(first.src, first.start);
+  } else {                                     // projeto só de áudio: sem player
+    $("player-wrap").classList.remove("has-video");
+  }
   updateActiveUI();
   drawTimeline();
 }
 $("btn-export-cancel").onclick = () => setExportOptsVisible(false);
 $("btn-export-go").onclick = async () => {
   const kept = state.segments.filter(s => !s.deleted);
-  if (!kept.length) return;
+  // projeto só de áudio: base preta + mix das trilhas, sem passo de vídeo
+  if (!kept.length) {
+    if (!state.audioTrack.length) return;
+    const btn = $("btn-export-go");
+    btn.disabled = true;
+    try {
+      const picked = await api("/api/pick-save?input=" +
+        encodeURIComponent(state.audioTrack[0].src) + "&suffix=editado&ext=mp4");
+      if (picked.cancelled) return;
+      setExportOptsVisible(false);
+      submitJob({
+        op: "mix_audio", output: picked.path, format: "mp4",
+        base_duration: timelineDur(),
+        tracks: state.audioTrack.map(c => [c.src, c.start, c.end, c.at, c.volume ?? 1]),
+      });
+    } catch (e) { alert("Erro na exportação: " + e.message); }
+    finally { btn.disabled = false; }
+    return;
+  }
   const srcs = [...new Set(kept.map(s => s.src))];
   const multi = srcs.length > 1;
   const format = $("export-format").value; // "" = manter original, ou "mp4"/"webm"
+  // textos gravados no vídeo exigem recodificar tudo (drawtext não sai em -c copy)
+  const burnTexts = state.texts.length > 0;
+  const origExt = activeSrc.split(".").pop().toLowerCase();
+  const burnFormat = format || (["mp4", "webm"].includes(origExt) ? origExt : "mp4");
   // multi-arquivo sempre recodifica/normaliza (formatos podem diferir) → mp4 por padrão
-  const ext = multi ? (format || "mp4") : (format || activeSrc.split(".").pop());
+  const ext = multi ? (format || "mp4")
+    : (burnTexts ? burnFormat : (format || origExt));
+  // fade preto nas emendas: metade na saída de um trecho, metade na entrada do outro
+  const fd = state.transition || 0;
+  const fades = (i) => [i > 0 && fd ? fd / 2 : 0,
+                        i < kept.length - 1 && fd ? fd / 2 : 0];
   const btn = $("btn-export-go");
   btn.disabled = true;
   try {
@@ -1222,20 +1952,40 @@ $("btn-export-go").onclick = async () => {
     if (multi) {
       body = {
         op: "render_multi", output: picked.path, format: format || "mp4",
-        parts: kept.map(s => [s.src, s.start, s.end, s.speed || 1, s.gap || 0]),
+        parts: kept.map((s, i) => [s.src, s.start, s.end, s.speed || 1, s.gap || 0,
+                                   s.volume ?? 1, s.opacity ?? 1, ...fades(i)]),
       };
     } else {
+      const conv = format || burnTexts;   // drawtext exige o caminho que recodifica
       body = {
-        op: format ? "render_convert" : "render",
+        op: conv ? "render_convert" : "render",
         input: kept[0].src, output: picked.path,
-        parts: kept.map(s => [s.start, s.end, s.speed || 1, s.gap || 0]),
+        parts: kept.map((s, i) => [s.start, s.end, s.speed || 1, s.gap || 0,
+                                   s.volume ?? 1, s.opacity ?? 1, ...fades(i)]),
       };
-      if (format) body.format = format;
+      if (conv) body.format = burnFormat;
     }
-    submitJob(body);
-    setExportOptsVisible(false);
+    if (burnTexts) body.texts = state.texts;
+
+    if (state.audioTrack.length) {
+      // 2 passagens: renderiza o vídeo num temporário e depois mixa a trilha
+      // (op_mix_audio copia o vídeo e só recodifica o áudio) → barato e isolado
+      const outExt = "." + (body.format || ext);
+      const tmp = picked.path.replace(/(\.[^.]+)$/, "") + ".basetmp" + outExt;
+      body.output = tmp;
+      setExportOptsVisible(false);
+      const j1 = await submitJob(body);
+      await pollJob(j1);
+      submitJob({
+        op: "mix_audio", input: tmp, output: picked.path, format: body.format || ext,
+        tracks: state.audioTrack.map(c => [c.src, c.start, c.end, c.at, c.volume ?? 1]),
+      });
+    } else {
+      submitJob(body);
+      setExportOptsVisible(false);
+    }
   } catch (e) {
-    alert("Erro ao escolher local de exportação: " + e.message);
+    alert("Erro na exportação: " + e.message);
   } finally {
     btn.disabled = false;
   }
@@ -1247,31 +1997,108 @@ document.addEventListener("keydown", (e) => {
   else if (e.ctrlKey && (e.key === "y" || (e.shiftKey && e.key === "Z"))) { e.preventDefault(); redo(); }
   else if (e.key === "c" && !e.ctrlKey && !$("btn-cut").disabled) doCut();
   else if (e.key === "Delete") deleteSelected();
-  else if (e.key === " " && activeSrc && e.target.tagName !== "BUTTON") {
+  else if (e.key === " " && hasContent() && e.target.tagName !== "BUTTON") {
     e.preventDefault();
-    player.paused ? player.play() : player.pause();
+    togglePlay();
   }
 });
 
 // ---------- render do estado (undo/redo re-renderiza tudo) ----------
 function renderState() {
   if (selectedSeg != null && selectedSeg >= state.segments.length) selectedSeg = null;
+  if (selectedAudio != null && selectedAudio >= state.audioTrack.length) selectedAudio = null;
+  if (selectedImage != null && selectedImage >= state.imageTrack.length) selectedImage = null;
 
   // botões da timeline
   const segs = state.segments;
   const kept = segs.filter(s => !s.deleted).length;
   const del = segs.length - kept;
-  const sped = segs.some(s => !s.deleted && s.speed && s.speed !== 1);
+  const sped = segs.some(s => !s.deleted &&
+    ((s.speed && s.speed !== 1) || (s.volume != null && s.volume !== 1) ||
+     (s.opacity != null && s.opacity !== 1)));
   const gapped = segs.some(s => !s.deleted && (s.gap || 0) > 1e-6);
   const nFiles = distinctSrcs().length;   // arquivos distintos na timeline
-  $("btn-cut").disabled = !segs.length;
-  $("btn-del-seg").disabled = selectedSeg == null || segs[selectedSeg]?.deleted;
+  const audioSel = selectedAudio != null ? state.audioTrack[selectedAudio] : null;
+  const imageSel = selectedImage != null ? state.imageTrack[selectedImage] : null;
+  // Dividir/Excluir operam só na FAIXA ATIVA (a última clicada)
+  const audioActive = activeTrack === "audio";
+  const imageActive = activeTrack === "image";
+  $("btn-cut").disabled = audioActive ? !state.audioTrack.length : (imageActive ? true : !segs.length);
+  $("btn-del-seg").disabled = imageActive ? (selectedImage == null)
+    : audioActive ? (selectedAudio == null)
+    : (selectedSeg == null || segs[selectedSeg]?.deleted);
+  $("btn-cut").title = audioActive ? "Dividir o clipe de áudio no cursor (tecla C)"
+    : imageActive ? "Imagens não podem ser divididas"
+    : "Dividir o segmento no cursor (tecla C)";
+  $("btn-del-seg").title = imageActive ? "Excluir a imagem selecionada (Delete)"
+    : audioActive ? "Excluir o clipe de áudio selecionado (Delete)"
+    : "Excluir segmento (tecla Delete)";
   const segEditable = selectedSeg != null && !segs[selectedSeg]?.deleted;
+  const spd = segEditable ? (segs[selectedSeg].speed || 1) : 1;
   $("seg-speed").disabled = !segEditable;
-  $("seg-speed").value = segEditable ? String(segs[selectedSeg].speed || 1) : "1";
-  // multi-arquivo já é motivo para exportar (junta os arquivos), além de cortes/velocidade/lacuna
-  $("btn-export").disabled = !(kept > 0 && (del > 0 || sped || gapped || nFiles > 1));
-  $("btn-save").disabled = !segs.length;   // salvar projeto: basta ter timeline
+  $("seg-speed").value = String(spd);
+  $("seg-speed-val").textContent = spd + "x";
+  $("seg-vol").disabled = !segEditable;
+  const volPct = segEditable ? Math.round((segs[selectedSeg].volume ?? 1) * 100) : 100;
+  $("seg-vol").value = volPct;
+  $("seg-vol-val").textContent = volPct + "%";
+  $("seg-op").disabled = !segEditable;
+  const opPct = segEditable ? Math.round((segs[selectedSeg].opacity ?? 1) * 100) : 100;
+  $("seg-op").value = opPct;
+  $("seg-op-val").textContent = opPct + "%";
+  $("btn-reset-adjust").disabled = !segEditable;
+  renderTexts();                                  // painel de textos segue o estado
+  $("trans-dur").value = String(state.transition || 0);
+  $("btn-add-text").disabled = !segs.length;
+
+  // painel de propriedades: segmento de vídeo OU clipe de áudio OU imagem selecionada
+  document.body.classList.toggle("has-props", segEditable || !!audioSel || !!imageSel);
+  document.body.classList.toggle("audio-sel", !!audioSel);
+  document.body.classList.toggle("image-sel", !!imageSel);
+  if (imageSel) {
+    const inf = sources.get(imageSel.src)?.info;
+    $("prop-file").textContent = basename(imageSel.src);
+    $("prop-file").title = imageSel.src;
+    $("prop-dur").textContent = fmtTime(imageSel.duration);
+    $("prop-res").textContent = "imagem";
+    $("prop-size").textContent = inf?.size ? fmtSize(inf.size) : "—";
+    $("prop-fps").textContent = "—";
+    $("seg-vol").disabled = false;
+    // slider para duração (1-10s, default 3)
+    const durVal = Math.round(imageSel.duration * 10) / 10;
+    $("seg-vol").min = 10; $("seg-vol").max = 100; $("seg-vol").step = 10;
+    $("seg-vol").value = Math.round(durVal * 10);
+    $("seg-vol-val").textContent = durVal.toFixed(1) + "s";
+  } else if (audioSel) {
+    const inf = sources.get(audioSel.src)?.info;
+    $("prop-file").textContent = basename(audioSel.src);
+    $("prop-file").title = audioSel.src;
+    $("prop-dur").textContent = fmtTime(audioSel.end - audioSel.start);
+    $("prop-res").textContent = "áudio";
+    $("prop-size").textContent = inf?.size ? fmtSize(inf.size) : "—";
+    $("prop-fps").textContent = "—";
+    $("seg-vol").disabled = false;
+    $("seg-vol").min = 0; $("seg-vol").max = 100; $("seg-vol").step = 5;
+    const avp = Math.round((audioSel.volume ?? 1) * 100);
+    $("seg-vol").value = avp; $("seg-vol-val").textContent = avp + "%";
+  } else if (segEditable) {
+    const sg = segs[selectedSeg];
+    const inf = sources.get(sg.src)?.info;
+    const v = inf?.video;
+    $("prop-file").textContent = basename(sg.src);
+    $("prop-file").title = sg.src;
+    $("prop-dur").textContent = fmtTime((sg.end - sg.start) / (sg.speed || 1));
+    $("prop-res").textContent = v ? `${v.width} × ${v.height}` : "—";
+    $("prop-size").textContent = inf?.size ? fmtSize(inf.size) : "—";
+    $("prop-fps").textContent = v?.fps ? fmtFps(v.fps) : "—";
+  }
+  // com vídeo: exporta se houver algo a fazer; sem vídeo: basta ter áudio/imagem
+  const videoExportable = kept > 0 && (del > 0 || sped || gapped || nFiles > 1
+    || state.texts.length > 0 || (state.transition > 0 && kept > 1)
+    || state.audioTrack.length > 0 || state.imageTrack.length > 0);
+  const audioOnlyExportable = kept === 0 && (state.audioTrack.length > 0 || state.imageTrack.length > 0);
+  $("btn-export").disabled = !(videoExportable || audioOnlyExportable);
+  $("btn-save").disabled = !hasContent();   // salvar projeto: basta ter timeline
   $("mark-info").textContent = (nFiles > 1 ? `${nFiles} arquivos · ` : "")
     + (segs.length > 1
       ? `${segs.length} segmentos` + (del ? ` · ${del} deletado${del > 1 ? "s" : ""}` : "")
@@ -1405,7 +2232,9 @@ $("conv-format").addEventListener("change", () => {
   badge.textContent = nvenc ? "NVENC" : "CPU";
   badge.classList.toggle("on", nvenc);
   if (!nvenc) { $("conv-gpu").checked = false; $("conv-gpu").disabled = true; }
-  await browse(cfg.startDir);
+  // retoma o último diretório salvo da aba de vídeo; se sumiu, cai no padrão
+  try { await browse(dirByKind.video || cfg.startDir); }
+  catch { await browse(cfg.startDir); }
   renderState();
   refreshJobs();
 })();
