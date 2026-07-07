@@ -925,10 +925,66 @@ def op_mix_audio(p):
     return start_job("mix_audio", cmd, base_dur, out, cleanup=[base] if base else None)
 
 
+def op_overlay_images(p):
+    """Passada extra da exportação: grava IMAGENS sobre um vídeo já renderizado
+    (overlay centralizado, escalado para caber no quadro), cada uma visível no
+    seu intervalo [at, at+dur] da linha do tempo da saída. O vídeo é recodificado
+    (overlay muda os pixels); o áudio da base é copiado.
+
+    input  = vídeo-base (temporário, apagado ao fim); sem input, gera uma base
+             preta de base_duration s (projeto sem vídeo).
+    images = [[src, at, dur], ...]
+    """
+    base = safe_path(p["input"]) if p.get("input") else None
+    images = [(safe_path(x[0]), float(x[1]), float(x[2])) for x in p["images"]]
+    if not images:
+        raise ValueError("nenhuma imagem para gravar")
+    out = safe_path(p["output"])
+    fmt = p.get("format") or os.path.splitext(out)[1].lstrip(".") or "mp4"
+
+    cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]
+    if base:
+        info = probe(base)
+        dur = info["duration"]
+        v = info["video"] or {}
+        W, H = int(v.get("width") or 1920), int(v.get("height") or 1080)
+        has_audio = bool(info["audio"])
+        cmd += ["-i", base]
+    else:
+        dur = float(p.get("base_duration") or 0) or max(at + d for _, at, d in images)
+        W, H, has_audio = 1920, 1080, False
+        cmd += ["-f", "lavfi", "-t", f"{dur:.3f}",
+                "-i", f"color=c=black:s={W}x{H}:r=30"]
+
+    filters, prev = [], "[0:v]"
+    for k, (src, at, d) in enumerate(images, start=1):
+        # imagem vira stream contínuo p/ o overlay; o -t limita o loop à duração
+        # da base — sem ele o input é infinito e o ffmpeg nunca encerra
+        cmd += ["-loop", "1", "-t", f"{dur:.3f}", "-i", src]
+        filters.append(f"[{k}:v]scale={W}:{H}:force_original_aspect_ratio=decrease[im{k}]")
+        filters.append(f"{prev}[im{k}]overlay=(W-w)/2:(H-h)/2:"
+                       f"enable='between(t,{at:.3f},{at + d:.3f})'[v{k}]")
+        prev = f"[v{k}]"
+    filters.append(f"{prev}format=yuv420p[vout]")
+    graph = ";".join(filters)
+
+    if fmt == "webm":
+        venc = ["-c:v", "libvpx-vp9", "-crf", "31", "-b:v", "0",
+                "-row-mt", "1", "-cpu-used", "2"]
+    elif NVENC:
+        venc = ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "23", "-b:v", "0"]
+    else:
+        venc = ["-c:v", "libx264", "-preset", "medium", "-crf", "23"]
+    amap = ["-map", "0:a", "-c:a", "copy"] if has_audio else ["-an"]
+    tail = ["-movflags", "+faststart"] if fmt == "mp4" else []
+    cmd += ["-filter_complex", graph, "-map", "[vout]"] + amap + venc + tail + [out]
+    return start_job("overlay_images", cmd, dur, out, cleanup=[base] if base else None)
+
+
 OPS = {"cut": op_cut, "join": op_join, "convert": op_convert,
        "extract": op_extract_audio, "delete": op_delete, "render": op_render,
        "render_convert": op_render_convert, "render_multi": op_render_multi,
-       "mix_audio": op_mix_audio}
+       "mix_audio": op_mix_audio, "overlay_images": op_overlay_images}
 
 
 # ---------- HTTP ----------
@@ -954,7 +1010,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "não encontrado"}, 404)
             return
         ctype = {"html": "text/html", "js": "text/javascript",
-                 "css": "text/css", "svg": "image/svg+xml"}.get(
+                 "css": "text/css", "svg": "image/svg+xml",
+                 "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                 "png": "image/png", "webp": "image/webp"}.get(
                      path.rsplit(".", 1)[-1], "application/octet-stream")
         with open(path, "rb") as f:
             data = f.read()

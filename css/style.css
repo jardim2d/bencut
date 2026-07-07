@@ -3,13 +3,24 @@
   /* tema escuro azul-arroxeado com acento violeta (layout estilo mockup) */
   --accent: #7a5cf0; --accent-dark: #6849dd; --accent-deep: #a99cf7;
   --bg: #171233; --panel: #1c1740; --panel2: #2c2440; --line: #2a2650;
+  --bg-rgb: 23, 18, 51; --panel-rgb: 28, 23, 64;   /* versões translúcidas p/ a textura aparecer por trás */
   --text: #e0dcf0; --dim: #9a94b8;
   --ok: #58b56b; --err: #e06055;
 }
 
 /* grade: rail | painel de mídia | centro | propriedades (4/5), timeline (1/5) */
 body {
-  background: var(--bg); color: var(--text);
+  /* a imagem É o fundo do app agora (substitui o roxo); um véu preto BAIXO
+     (não mais o roxo) só o suficiente pra manter o texto claro legível */
+  background-color: #000;
+  background-image:
+    linear-gradient(rgba(0, 0, 0, .4), rgba(0, 0, 0, .4)),
+    url("/icons/backgownd.jpg");
+  background-size: cover, cover;
+  background-position: center, center;
+  background-repeat: no-repeat, no-repeat;
+  background-attachment: fixed, fixed;
+  color: var(--text);
   font: 14px/1.5 system-ui, sans-serif;
   height: 100vh; overflow: hidden;
   display: grid;
@@ -57,7 +68,7 @@ select:disabled { opacity: .4; cursor: default; }
 /* ── rail de navegação (coluna 1) ── */
 #rail {
   grid-column: 1; grid-row: 1;
-  background: var(--bg); border-right: 1px solid var(--line);
+  background: rgba(0, 0, 0, .38); border-right: 1px solid var(--line);
   display: flex; flex-direction: column; align-items: stretch; padding-top: 8px;
 }
 .rail-btn {
@@ -72,7 +83,7 @@ select:disabled { opacity: .4; cursor: default; }
 /* ── painel lateral de mídia (coluna 2) ── */
 #side {
   grid-column: 2; grid-row: 1;
-  background: var(--panel); border-right: 1px solid var(--line);
+  background: rgba(0, 0, 0, .48); border-right: 1px solid var(--line);
   display: flex; flex-direction: column; min-height: 0;
   position: relative;
 }
@@ -245,7 +256,7 @@ li .grow { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowr
 }
 header {
   display: flex; align-items: center; gap: 10px;
-  padding: 8px 16px; background: var(--bg);
+  padding: 8px 16px; background: rgba(0, 0, 0, .38);
   border-bottom: 1px solid var(--line);
 }
 #logo {
@@ -287,6 +298,13 @@ header h1 { font-size: 15px; font-weight: 700; letter-spacing: .3px; color: #fff
 #player-wrap.showing-image #img-preview { display: block; }
 #player-wrap.showing-image video,
 #player-wrap.showing-image #player-empty { display: none; }
+/* imagens da timeline sobre o vídeo (espelha o overlay gravado no export:
+   centralizada, escalada para caber no quadro) */
+#image-overlay { position: absolute; inset: 0; pointer-events: none; border-radius: 6px; overflow: hidden; }
+#image-overlay img {
+  position: absolute; inset: 0; margin: auto;
+  max-width: 100%; max-height: 100%;
+}
 /* cobre o vídeo com preto durante as lacunas (reprodução e scrub) */
 #gap-overlay {
   position: absolute; inset: 0; background: #000; display: none;
@@ -298,7 +316,7 @@ header h1 { font-size: 15px; font-weight: 700; letter-spacing: .3px; color: #fff
 /* ── painel de propriedades (coluna 4; visível só com segmento selecionado) ── */
 #props {
   grid-column: 4; grid-row: 1;
-  background: var(--panel); border-left: 1px solid var(--line);
+  background: rgba(0, 0, 0, .48); border-left: 1px solid var(--line);
   padding: 14px 16px; overflow-y: auto; min-height: 0;
 }
 body:not(.has-props) #props { display: none; }
@@ -328,8 +346,11 @@ body:not(.has-props) #props { display: none; }
   font-variant-numeric: tabular-nums;
 }
 #btn-reset-adjust { width: 100%; justify-content: center; margin-top: 14px; }
-/* com um clipe de áudio selecionado, só Volume faz sentido nos Ajustes */
-body.audio-sel #row-speed, body.audio-sel #row-op, body.audio-sel #btn-reset-adjust { display: none; }
+/* com um clipe de áudio selecionado, só Volume faz sentido nos Ajustes;
+   com imagem, nenhum ajuste (duração ajusta-se pela borda do clipe na timeline) */
+body.audio-sel #row-speed, body.audio-sel #row-op, body.audio-sel #btn-reset-adjust,
+body.image-sel #row-speed, body.image-sel #row-op, body.image-sel #row-vol,
+body.image-sel #props h3, body.image-sel #btn-reset-adjust { display: none; }
 #atrack { display: none; }
 /* alça de redimensionamento na borda esquerda do painel de propriedades */
 #props { position: relative; }
@@ -342,7 +363,7 @@ body.audio-sel #row-speed, body.audio-sel #row-op, body.audio-sel #btn-reset-adj
 /* ── faixa inferior: toolbar + timeline (altura ajustável, largura total) ── */
 #bottom {
   grid-column: 1 / -1; grid-row: 2;
-  background: var(--bg); border-top: 1px solid var(--line);
+  background: rgba(0, 0, 0, .38); border-top: 1px solid var(--line);
   display: flex; flex-direction: column; gap: 8px;
   padding: 10px 16px; min-height: 0;
   position: relative;
@@ -364,6 +385,9 @@ body.audio-sel #row-speed, body.audio-sel #row-op, body.audio-sel #btn-reset-adj
 #cut-controls button.danger:hover:not(:disabled) {
   background: rgba(224,96,85,.15); color: var(--err);
 }
+/* botão de Play/Pausa: destaque violeta sutil enquanto toca, pra ficar óbvio
+   que é ELE (e não os controles nativos do vídeo) quem controla a reprodução */
+#btn-play.playing { background: rgba(122,92,240,.22); color: var(--accent-deep); }
 /* exceto Converter, que segue primário (violeta) */
 #cut-controls button.primary {
   background: var(--accent); border-color: var(--accent); color: #fff;
