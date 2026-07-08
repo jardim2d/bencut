@@ -33,6 +33,15 @@
     </svg>
     <span>Transição</span>
   </button>
+  <button id="rail-bg" class="rail-btn" data-view="bg-panel" title="Trocar a imagem de fundo do app">
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor"
+         stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="2.5" y="4" width="19" height="16" rx="2.5"/>
+      <path d="M2.5 16.5l5.5-5.5a2 2 0 0 1 2.8 0l4.7 4.7M13.5 13l1.8-1.8a2 2 0 0 1 2.8 0l3.4 3.4"/>
+      <circle cx="8" cy="9" r="1.6"/>
+    </svg>
+    <span>Fundo</span>
+  </button>
 </nav>
 
 <!-- painel lateral de mídia: topo → 4/5 da tela -->
@@ -68,6 +77,11 @@
     </label>
     <p class="side-note">Aplicada em todas as emendas na exportação (fade de saída +
       fade de entrada). O preview continua mostrando corte seco.</p>
+  </div>
+  <div id="bg-panel" class="side-view hidden">
+    <h2>Fundo do app</h2>
+    <div id="bg-grid"></div>
+    <p class="side-note">Só muda a aparência do editor — não entra no vídeo exportado.</p>
   </div>
   <div id="side-resizer" title="Arraste para redimensionar · duplo clique restaura"></div>
 </aside>
@@ -146,7 +160,7 @@
       <span id="seg-op-val">100%</span>
     </span>
   </label>
-  <button id="btn-reset-adjust" disabled title="Volta velocidade, volume e opacidade ao padrão">Redefinir</button>
+  <button id="btn-reset-adjust" disabled title="Volta os ajustes ao padrão">Redefinir</button>
 </aside>
 
 <!-- faixa inferior: largura total, altura ajustável pela alça, toolbar + timeline -->

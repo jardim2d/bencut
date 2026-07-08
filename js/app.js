@@ -390,6 +390,37 @@ for (const btn of document.querySelectorAll(".rail-btn")) {
   };
 }
 
+// ---------- fundo do app (aba "Fundo" no rail) ----------
+// só troca a aparência do editor (não entra no vídeo); persistido em
+// localStorage e aplicado via a custom property --bg-image (body no CSS)
+function applyBgImage(name) {
+  document.body.style.setProperty("--bg-image", `url("/icons/${name}")`);
+  for (const el of document.querySelectorAll("#bg-grid .bg-thumb"))
+    el.classList.toggle("selected", el.dataset.name === name);
+}
+(async () => {
+  let names;
+  try { ({ backgrounds: names } = await api("/api/backgrounds")); }
+  catch { return; }   // painel fica vazio se a listagem falhar; resto do app não é afetado
+  if (!names.length) return;
+  const saved = localStorage.getItem("bgImage");
+  const current = names.includes(saved) ? saved : names[0];
+  const grid = $("bg-grid");
+  for (const name of names) {
+    const btn = document.createElement("button");
+    btn.className = "bg-thumb";
+    btn.dataset.name = name;
+    btn.title = name;
+    const img = document.createElement("img");
+    img.src = "/icons/" + name;
+    img.loading = "lazy";
+    btn.appendChild(img);
+    btn.onclick = () => { localStorage.setItem("bgImage", name); applyBgImage(name); };
+    grid.appendChild(btn);
+  }
+  applyBgImage(current);
+})();
+
 // painel de propriedades redimensionável pela borda esquerda (como o lateral)
 {
   const MIN_W = 220;
@@ -862,10 +893,13 @@ let panAnchorSrc = null;   // tempo-fonte a manter no centro durante a junção 
 const RULER_CSS_H = 18;                          // altura da régua (px CSS) = zona de scrub
 const TL_MIN_SPAN = 0.5;                       // menor trecho visível (s), limita o zoom in
 const TL_MIN_ZOOM = 0.2;                        // zoom out além do original (timeline encolhe)
+// duração NA TIMELINE de um clipe de áudio: o trecho de origem (end-start)
+// encolhe/estica com a velocidade, igual ao segmento de vídeo (segVis)
+const audioVis = (c) => (c.end - c.start) / (c.speed || 1);
 // fim (em tempo visível) do clipe de áudio mais distante; 0 se não há trilha
 function maxAudioEnd() {
   let m = 0;
-  for (const c of state.audioTrack) m = Math.max(m, c.at + (c.end - c.start));
+  for (const c of state.audioTrack) m = Math.max(m, c.at + audioVis(c));
   return m;
 }
 // fim da imagem mais distante (mesma ideia)
@@ -913,7 +947,9 @@ function syncScrubFx() {
 }
 
 // mostra os textos ativos no tempo visível vt sobre o player, espelhando o
-// export: mesma âncora (h/12), mesma escala de fonte (altura/14) e fundo
+// export: mesma âncora (h/12), mesma escala de fonte (altura/14) e fundo.
+// Além dos 3 presets (topo/centro/base), o texto pode ser arrastado p/
+// qualquer ponto (t.x/t.y, % do player) — quando presentes, sobrepõem `pos`.
 function updateTextOverlay(vt) {
   const ov = $("text-overlay");
   const active = vt == null ? [] : state.texts.filter(t => vt >= t.start && vt <= t.end);
@@ -923,18 +959,74 @@ function updateTextOverlay(vt) {
   ov.textContent = "";
   for (const t of active) {
     const d = document.createElement("div");
-    d.className = "tx pos-" + (t.pos || "bottom");
+    d.dataset.idx = String(state.texts.indexOf(t));
     d.style.fontSize = fs + "px";
     d.textContent = t.text;
+    if (t.x != null && t.y != null) {
+      d.className = "tx free";
+      d.style.left = t.x + "%";
+      d.style.top = t.y + "%";
+    } else {
+      d.className = "tx pos-" + (t.pos || "bottom");
+    }
     ov.appendChild(d);
   }
 }
+
+// arraste livre de um texto no preview: pega qualquer .tx visível (a área
+// vazia do overlay continua com pointer-events:none, então não atrapalha o
+// scrub/clique do player) e move em % do player-wrap. Escuta no CONTAINER
+// (estável) em vez do próprio .tx (recriado a cada updateTextOverlay), então
+// sobrevive a redraws no meio do gesto (ex.: arrastar durante a reprodução).
+$("text-overlay").addEventListener("pointerdown", (e) => {
+  const el = e.target.closest(".tx");
+  if (!el) return;
+  const idx = parseInt(el.dataset.idx, 10);
+  const wrap = $("player-wrap").getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  textDrag = {
+    idx,
+    startX: e.clientX, startY: e.clientY,
+    // ponto de partida em %: centro do texto tal como está renderizado agora
+    // (preset ou já livre) — assim o arraste não "pula" no primeiro movimento
+    origX: ((r.left + r.width / 2 - wrap.left) / wrap.width) * 100,
+    origY: ((r.top + r.height / 2 - wrap.top) / wrap.height) * 100,
+    hist: false,
+  };
+  $("text-overlay").setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+$("text-overlay").addEventListener("pointermove", (e) => {
+  if (!textDrag) return;
+  const wrap = $("player-wrap").getBoundingClientRect();
+  const dxPct = ((e.clientX - textDrag.startX) / wrap.width) * 100;
+  const dyPct = ((e.clientY - textDrag.startY) / wrap.height) * 100;
+  if (!textDrag.hist && (Math.abs(dxPct) > 0.3 || Math.abs(dyPct) > 0.3)) {
+    history.past.push(JSON.stringify(state));
+    if (history.past.length > MAX_HISTORY) history.past.shift();
+    history.future = []; textDrag.hist = true;
+  }
+  const t = state.texts[textDrag.idx];
+  if (!t) return;
+  t.x = Math.max(0, Math.min(100, textDrag.origX + dxPct));
+  t.y = Math.max(0, Math.min(100, textDrag.origY + dyPct));
+  updateTextOverlay(currentVis());
+});
+function endTextDrag(e) {
+  if (!textDrag) return;
+  $("text-overlay").releasePointerCapture(e.pointerId);
+  const moved = textDrag.hist;
+  textDrag = null;
+  if (moved) renderState();   // sincroniza o painel (dropdown de posição vira "Livre")
+}
+$("text-overlay").addEventListener("pointerup", endTextDrag);
+$("text-overlay").addEventListener("pointercancel", endTextDrag);
 
 // índice do clipe de áudio da lane `lane` no tempo visível vt (-1 se nenhum)
 function audioIdxAtVisible(vt, lane) {
   for (let i = 0; i < state.audioTrack.length; i++) {
     const c = state.audioTrack[i];
-    if ((c.track || 0) === lane && vt >= c.at && vt <= c.at + (c.end - c.start)) return i;
+    if ((c.track || 0) === lane && vt >= c.at && vt <= c.at + audioVis(c)) return i;
   }
   return -1;
 }
@@ -945,12 +1037,12 @@ function audioIdxAtVisible(vt, lane) {
 const SNAP_PX = 8;
 function snapAudioAt(at, movingIdx) {
   const c = state.audioTrack[movingIdx];
-  const len = c.end - c.start;
+  const len = audioVis(c);
   const thresh = SNAP_PX * (tlSpan() / Math.max(1, canvas.clientWidth));  // px → s
   const targets = [0];                              // início da timeline
   state.audioTrack.forEach((o, j) => {              // só encaixa em clipes da MESMA lane
     if (j !== movingIdx && (o.track || 0) === (c.track || 0))
-      targets.push(o.at, o.at + (o.end - o.start));
+      targets.push(o.at, o.at + audioVis(o));
   });
   let bestAt = at, bestDist = thresh;
   for (const t of targets) {
@@ -995,6 +1087,18 @@ function mediaLaneAt(e) {
   const y = e.clientY - canvas.getBoundingClientRect().top - mediaAreaTopCss();
   return Math.max(0, Math.min(audioLaneCount() + imageLaneCount() - 1, Math.floor(y / trackHeightCss())));
 }
+// lane de ÁUDIO sob o ponteiro (arrastar p/ dentro da área de imagem prende
+// na última lane de áudio — não cruza p/ o outro tipo de faixa)
+function audioLaneAt(e) {
+  const n = audioLaneCount();
+  return n > 0 ? Math.max(0, Math.min(n - 1, mediaLaneAt(e))) : 0;
+}
+// lane de IMAGEM sob o ponteiro (mesma ideia, prende na 1ª lane de imagem
+// se o ponteiro estiver na área de áudio)
+function imageLaneAt(e) {
+  const n = imageLaneCount();
+  return n > 0 ? Math.max(0, Math.min(n - 1, mediaLaneAt(e) - audioLaneCount())) : 0;
+}
 // índice da imagem da lane `lane` no tempo visível vt (-1 se nenhuma)
 function imageIdxAtVisible(vt, lane) {
   for (let i = 0; i < state.imageTrack.length; i++) {
@@ -1009,18 +1113,22 @@ function imageIdxAtVisible(vt, lane) {
 // cada frame do timeupdate.
 function syncImageOverlay(vt) {
   const ov = $("image-overlay");
-  const want = [];
+  const active = [];
   if (vt != null) state.imageTrack.forEach((c, i) => {
-    if (vt >= c.at && vt < c.at + c.duration) want.push(i + ":" + c.src);
+    if (vt >= c.at && vt < c.at + c.duration) active.push([i + ":" + c.src, c.opacity ?? 1]);
   });
+  const wantKeys = active.map(([key]) => key);
   for (const el of [...ov.children])
-    if (!want.includes(el.dataset.key)) el.remove();
-  for (const key of want) {
-    if ([...ov.children].some(el => el.dataset.key === key)) continue;
-    const img = document.createElement("img");
-    img.dataset.key = key;
-    img.src = "/api/media?path=" + encodeURIComponent(key.slice(key.indexOf(":") + 1));
-    ov.appendChild(img);
+    if (!wantKeys.includes(el.dataset.key)) el.remove();
+  for (const [key, op] of active) {
+    let img = [...ov.children].find(el => el.dataset.key === key);
+    if (!img) {
+      img = document.createElement("img");
+      img.dataset.key = key;
+      img.src = "/api/media?path=" + encodeURIComponent(key.slice(key.indexOf(":") + 1));
+      ov.appendChild(img);
+    }
+    img.style.opacity = String(op);
   }
 }
 
@@ -1031,7 +1139,7 @@ function imageSnapTargets(movingIdx) {
   state.imageTrack.forEach((o, j) => {
     if (j !== movingIdx) targets.push(o.at, o.at + o.duration);
   });
-  for (const o of state.audioTrack) targets.push(o.at, o.at + (o.end - o.start));
+  for (const o of state.audioTrack) targets.push(o.at, o.at + audioVis(o));
   for (const s of keptSegs()) {
     const p = animPos.get(segKey(s)) ?? 0;
     targets.push(p, p + segVis(s));
@@ -1097,7 +1205,7 @@ async function addImageClip(path, at) {
   const lane = imageLaneCount();       // nova lane para esta imagem
   const dur = 3;                       // duração padrão: 3 segundos
   const firstMedia = !hasContent();
-  apply(st => st.imageTrack.push({ src: path, at: pos, duration: dur, track: lane, hue: nextHue() }));
+  apply(st => st.imageTrack.push({ src: path, at: pos, duration: dur, opacity: 1, track: lane, hue: nextHue() }));
   selectedImage = state.imageTrack.length - 1;
   selectedSeg = null;
   selectedAudio = null;
@@ -1115,14 +1223,15 @@ function syncAudioTrack(playVis) {
   for (let lane = 0; lane < nAudio; lane++) {
     const a = audioEl(lane);
     const c = playVis == null ? null : state.audioTrack.find(c =>
-      (c.track || 0) === lane && playVis >= c.at && playVis < c.at + (c.end - c.start));
+      (c.track || 0) === lane && playVis >= c.at && playVis < c.at + audioVis(c));
     if (!c) { if (!a.paused) a.pause(); continue; }
     if (a.dataset.src !== c.src) {
       a.src = "/api/media?path=" + encodeURIComponent(c.src);
       a.dataset.src = c.src;
     }
     a.volume = c.volume ?? 1;
-    const want = c.start + (playVis - c.at);
+    a.playbackRate = c.speed || 1;
+    const want = c.start + (playVis - c.at) * (c.speed || 1);
     if (playing) {
       if (a.paused) a.play().catch(() => {});
       if (Math.abs(a.currentTime - want) > 0.3) { try { a.currentTime = want; } catch {} }
@@ -1146,7 +1255,7 @@ async function addAudioClip(path, at) {
   const lane = audioLaneCount();              // nova lane para este arquivo
   const firstMedia = !hasContent();
   apply(st => st.audioTrack.push(
-    { src: path, start: 0, end: dur, at: pos, volume: 1, track: lane, hue: nextHue() }));
+    { src: path, start: 0, end: dur, at: pos, volume: 1, speed: 1, track: lane, hue: nextHue() }));
   selectedAudio = state.audioTrack.length - 1;
   selectedSeg = null;
   selectedImage = null;
@@ -1239,7 +1348,7 @@ function drawTimeline() {
   for (let i = 0; i < state.audioTrack.length; i++) {
     const c = state.audioTrack[i];
     const laneTop = mediaAreaTop + (c.track || 0) * mediaLaneH;
-    const x0 = sx(c.at), wd = (c.end - c.start) * scale;
+    const x0 = sx(c.at), wd = audioVis(c) * scale;
     const sel = i === selectedAudio;
     const hue = c.hue ?? 158;
     ctx.fillStyle = `hsla(${hue}, 60%, 45%, ${sel ? 0.92 : 0.62})`;
@@ -1252,7 +1361,8 @@ function drawTimeline() {
     ctx.beginPath(); ctx.rect(x0, laneTop, wd, mediaLaneH); ctx.clip();
     ctx.fillStyle = "#eafff6"; ctx.font = `${9.5 * dpr}px system-ui, sans-serif`;
     ctx.textBaseline = "middle";
-    ctx.fillText("🎵 " + basename(c.src), x0 + 5 * dpr, laneTop + mediaLaneH / 2);
+    const alabel = "🎵 " + basename(c.src) + (c.speed && c.speed !== 1 ? ` (${c.speed}x)` : "");
+    ctx.fillText(alabel, x0 + 5 * dpr, laneTop + mediaLaneH / 2);
     ctx.restore();
   }
   // clipes de imagem: a própria imagem ladrilhada dentro do clipe (fallback:
@@ -1366,6 +1476,8 @@ let imageMoving = false, imageMoveIdx = -1, imageMoveBaseX = 0, imageMoveOrigAt 
 // aparar borda de clipe de imagem: {idx, edge:"L"|"R", origAt, origDur, baseX, span0, hist}
 let imageTrim = null;
 const IMG_MIN_DUR = 0.5;   // duração mínima de uma imagem ao aparar (s)
+// arraste livre de um texto sobre o player: {idx, startX, startY, origX, origY, hist}
+let textDrag = null;
 let segMoveNextIdx = -1, segMoveOrigNextGap = 0;   // próximo trecho mantido e sua lacuna
 let segMoveBaseX = 0;   // clientX de referência do arraste (re-ancorado a cada troca de ordem)
 
@@ -1408,7 +1520,7 @@ function allTrackEdges() {
     const p = animPos.get(segKey(s)) ?? 0;
     edges.push(p, p + segVis(s));
   }
-  for (const c of state.audioTrack) edges.push(c.at, c.at + (c.end - c.start));
+  for (const c of state.audioTrack) edges.push(c.at, c.at + audioVis(c));
   for (const c of state.imageTrack) edges.push(c.at, c.at + c.duration);
   return edges;
 }
@@ -1623,6 +1735,9 @@ canvas.addEventListener("pointermove", (e) => {
     const rect = canvas.getBoundingClientRect();
     const dSec = (e.clientX - audioMoveBaseX) / rect.width * tlSpan();
     const c = state.audioTrack[audioMoveIdx];
+    // muda de lane ANTES de arredondar/encaixar `at`, p/ o snap já considerar
+    // os vizinhos da lane de destino (arraste diagonal: horizontal + vertical)
+    if (inMediaLane(e)) c.track = audioLaneAt(e);
     c.at = snapAudioAt(Math.max(0, audioMoveOrigAt + dSec), audioMoveIdx);
     clampView();
     drawTimeline();
@@ -1638,6 +1753,7 @@ canvas.addEventListener("pointermove", (e) => {
     const rect = canvas.getBoundingClientRect();
     const dSec = (e.clientX - imageMoveBaseX) / rect.width * tlSpan();
     const c = state.imageTrack[imageMoveIdx];
+    if (inMediaLane(e)) c.track = imageLaneAt(e);
     c.at = snapImageAt(Math.max(0, imageMoveOrigAt + dSec), imageMoveIdx);
     clampView();
     drawTimeline();
@@ -1931,15 +2047,15 @@ function doCut() {
       { ...seg, start: t, gap: 0, hue: nextHue() });
   });
 }
-// divide o clipe de áudio sob o playhead em dois (áudio a 1x: offset visível =
-// offset na fonte, então o ponto de corte na fonte é start + (vt - at))
+// divide o clipe de áudio sob o playhead em dois (o ponto de corte na fonte
+// leva a velocidade em conta: offset na fonte = offset visível × speed)
 function doCutAudio() {
   const vt = currentVis();
   const i = state.audioTrack.findIndex(c =>
-    vt > c.at + CUT_EPS && vt < c.at + (c.end - c.start) - CUT_EPS);
+    vt > c.at + CUT_EPS && vt < c.at + audioVis(c) - CUT_EPS);
   if (i < 0) return;
   const c = state.audioTrack[i];
-  const cut = c.start + (vt - c.at);
+  const cut = c.start + (vt - c.at) * (c.speed || 1);
   selectedAudio = null;
   apply(s => {
     s.audioTrack.splice(i, 1,
@@ -2049,9 +2165,18 @@ const withSelected = (fn) => {
 $("seg-speed").oninput = () => {
   const sp = parseFloat($("seg-speed").value);
   $("seg-speed-val").textContent = sp + "x";
-  player.playbackRate = sp;                    // sensação imediata do ajuste
+  // sensação imediata: no clipe de áudio ajusta o <audio> da lane, senão o player
+  if (selectedAudio != null) audioEl(state.audioTrack[selectedAudio].track || 0).playbackRate = sp;
+  else player.playbackRate = sp;
 };
-$("seg-speed").onchange = setSpeedSelected;
+$("seg-speed").onchange = () => {
+  if (selectedAudio != null) {
+    const i = selectedAudio;
+    apply(s => { s.audioTrack[i].speed = parseFloat($("seg-speed").value); });
+    return;
+  }
+  setSpeedSelected();
+};
 $("seg-vol").oninput = () => {
   $("seg-vol-val").textContent = $("seg-vol").value + "%";
   const v = $("seg-vol").value / 100;
@@ -2070,15 +2195,36 @@ $("seg-vol").onchange = () => {
 };
 $("seg-op").oninput = () => {
   $("seg-op-val").textContent = $("seg-op").value + "%";
-  applyOpacity($("seg-op").value / 100);       // visão imediata do ajuste
+  const v = $("seg-op").value / 100;
+  // preview imediato: na imagem selecionada (se visível agora) ajusta o <img>, senão o player
+  if (selectedImage != null) {
+    const img = [...$("image-overlay").children]
+      .find(el => el.dataset.key === selectedImage + ":" + state.imageTrack[selectedImage].src);
+    if (img) img.style.opacity = String(v);
+  } else applyOpacity(v);
 };
-$("seg-op").onchange = () => withSelected(i => {
+$("seg-op").onchange = () => {
   const v = parseInt($("seg-op").value, 10) / 100;
-  apply(s => { s.segments[i].opacity = v; });
-});
-$("btn-reset-adjust").onclick = () => withSelected(i => {
-  apply(s => Object.assign(s.segments[i], { speed: 1, volume: 1, opacity: 1 }));
-});
+  if (selectedImage != null) {
+    const i = selectedImage;
+    apply(s => { s.imageTrack[i].opacity = v; });
+    return;
+  }
+  withSelected(i => apply(s => { s.segments[i].opacity = v; }));
+};
+$("btn-reset-adjust").onclick = () => {
+  if (selectedAudio != null) {
+    const i = selectedAudio;
+    apply(s => Object.assign(s.audioTrack[i], { speed: 1, volume: 1 }));
+    return;
+  }
+  if (selectedImage != null) {
+    const i = selectedImage;
+    apply(s => { s.imageTrack[i].opacity = 1; });
+    return;
+  }
+  withSelected(i => apply(s => Object.assign(s.segments[i], { speed: 1, volume: 1, opacity: 1 })));
+};
 
 // ---------- textos sobre o vídeo ----------
 $("btn-add-text").onclick = () => {
@@ -2112,12 +2258,23 @@ function renderTexts() {
     const start = mkNum(t.start, (o, v) => { o.start = v; });
     const end = mkNum(t.end, (o, v) => { o.end = v; });
     const pos = document.createElement("select");
-    for (const [v, label] of [["top", "Topo"], ["center", "Centro"], ["bottom", "Base"]]) {
+    // arrastado livremente (t.x/t.y setados): mostra um rótulo informativo,
+    // sem nenhum preset marcado — escolher um preset abaixo volta a ancorar
+    // o texto nele (limpa x/y) mesmo que seja o mesmo valor de antes do arraste
+    const isFree = t.x != null && t.y != null;
+    if (isFree) {
       const op = document.createElement("option");
-      op.value = v; op.textContent = label; op.selected = (t.pos || "bottom") === v;
+      op.value = ""; op.textContent = "Livre (arrastado)"; op.selected = true; op.disabled = true;
       pos.appendChild(op);
     }
-    pos.onchange = () => apply(s => { s.texts[i].pos = pos.value; });
+    for (const [v, label] of [["top", "Topo"], ["center", "Centro"], ["bottom", "Base"]]) {
+      const op = document.createElement("option");
+      op.value = v; op.textContent = label; op.selected = !isFree && (t.pos || "bottom") === v;
+      pos.appendChild(op);
+    }
+    pos.onchange = () => apply(s => {
+      s.texts[i].pos = pos.value; s.texts[i].x = null; s.texts[i].y = null;
+    });
     const rm = document.createElement("button");
     rm.className = "rm"; rm.textContent = "✕"; rm.title = "Remover texto";
     rm.onclick = () => apply(s => s.texts.splice(i, 1));
@@ -2225,8 +2382,8 @@ async function loadProject(path) {
 $("btn-export-cancel").onclick = () => setExportOptsVisible(false);
 $("btn-export-go").onclick = async () => {
   const kept = state.segments.filter(s => !s.deleted);
-  const images = state.imageTrack.map(c => [c.src, c.at, c.duration]);
-  const audios = state.audioTrack.map(c => [c.src, c.start, c.end, c.at, c.volume ?? 1]);
+  const images = state.imageTrack.map(c => [c.src, c.at, c.duration, c.opacity ?? 1]);
+  const audios = state.audioTrack.map(c => [c.src, c.start, c.end, c.at, c.volume ?? 1, c.speed ?? 1]);
   // projeto SEM vídeo: base preta com as imagens gravadas e/ou mix das trilhas
   if (!kept.length) {
     if (!audios.length && !images.length) return;
@@ -2415,18 +2572,26 @@ function renderState() {
     $("prop-size").textContent = inf?.size ? fmtSize(inf.size) : "—";
     $("prop-fps").textContent = "—";
     // duração não tem slider: ajusta-se arrastando a borda do clipe na timeline
+    $("seg-op").disabled = false;
+    const iop = Math.round((imageSel.opacity ?? 1) * 100);
+    $("seg-op").value = iop; $("seg-op-val").textContent = iop + "%";
+    $("btn-reset-adjust").disabled = false;
   } else if (audioSel) {
     const inf = sources.get(audioSel.src)?.info;
     $("prop-file").textContent = basename(audioSel.src);
     $("prop-file").title = audioSel.src;
-    $("prop-dur").textContent = fmtTime(audioSel.end - audioSel.start);
+    $("prop-dur").textContent = fmtTime(audioVis(audioSel));
     $("prop-res").textContent = "áudio";
     $("prop-size").textContent = inf?.size ? fmtSize(inf.size) : "—";
     $("prop-fps").textContent = "—";
+    $("seg-speed").disabled = false;
+    const aspd = audioSel.speed || 1;
+    $("seg-speed").value = String(aspd); $("seg-speed-val").textContent = aspd + "x";
     $("seg-vol").disabled = false;
     $("seg-vol").min = 0; $("seg-vol").max = 100; $("seg-vol").step = 5;
     const avp = Math.round((audioSel.volume ?? 1) * 100);
     $("seg-vol").value = avp; $("seg-vol-val").textContent = avp + "%";
+    $("btn-reset-adjust").disabled = false;
   } else if (segEditable) {
     const sg = segs[selectedSeg];
     const inf = sources.get(sg.src)?.info;

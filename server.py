@@ -24,6 +24,7 @@ VIDEO_EXTS = {".mp4", ".mkv", ".m4v", ".mov", ".avi", ".webm", ".ts", ".flv", ".
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav", ".wma"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".tif", ".tiff"}
 PROJECT_EXT = ".evp"   # projeto do BenCut (JSON com os segmentos da timeline)
+BG_RE = re.compile(r"^backgownd(\d+)\.(jpg|jpeg|png|webp)$", re.IGNORECASE)
 # content-type por extensão de imagem (para o <img> exibir corretamente)
 IMAGE_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
               ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
@@ -307,9 +308,12 @@ def find_font():
 def drawtext_filters(texts, height, out_dir, tmp_files):
     """Cadeia de drawtext p/ gravar os textos no vídeo exportado.
 
-    texts = [{text, start, end, pos}] com tempos na linha do tempo do ARQUIVO
-    FINAL (o filtro roda depois da concatenação). Estilo espelha o preview:
-    branco, caixa preta translúcida, fonte ~altura/14, ancorado em h/12.
+    texts = [{text, start, end, pos, x, y}] com tempos na linha do tempo do
+    ARQUIVO FINAL (o filtro roda depois da concatenação). Estilo espelha o
+    preview: branco, caixa preta translúcida, fonte ~altura/14. `pos` ancora
+    em topo/centro/base (h/12 de margem); x/y (opcionais, % da tela, 0-100)
+    posicionam livremente e têm prioridade sobre `pos` quando presentes —
+    mesmo ponto de ancoragem do preview (centro da caixa no ponto arrastado).
 
     O conteúdo vai em textfile= (arquivo temporário) porque no FFmpeg 7 as
     aspas não protegem mais ':' no parser de opções — assim nenhum caractere
@@ -324,13 +328,17 @@ def drawtext_filters(texts, height, out_dir, tmp_files):
         with open(tf, "w") as f:
             f.write(str(t.get("text", "")))
         tmp_files.append(tf)
-        pos = t.get("pos", "bottom")
-        if pos == "top":
-            xy = "x=(w-text_w)/2:y=h/12"
-        elif pos == "center":
-            xy = "x=(w-text_w)/2:y=(h-text_h)/2"
+        if t.get("x") is not None and t.get("y") is not None:
+            xf, yf = float(t["x"]) / 100.0, float(t["y"]) / 100.0
+            xy = f"x={xf:.4f}*w-text_w/2:y={yf:.4f}*h-text_h/2"
         else:
-            xy = "x=(w-text_w)/2:y=h-text_h-h/12"
+            pos = t.get("pos", "bottom")
+            if pos == "top":
+                xy = "x=(w-text_w)/2:y=h/12"
+            elif pos == "center":
+                xy = "x=(w-text_w)/2:y=(h-text_h)/2"
+            else:
+                xy = "x=(w-text_w)/2:y=h-text_h-h/12"
         st, en = float(t.get("start", 0)), float(t.get("end", 0))
         chain.append(
             f"drawtext=fontfile={font}:textfile={tf}:expansion=none:"
@@ -874,11 +882,12 @@ def op_mix_audio(p):
     renderizado. O vídeo é COPIADO (sem re-encode); só o áudio é recodificado.
 
     input  = vídeo-base (temporário, apagado ao fim)
-    tracks = [[src, start, end, at, volume], ...]  (at = posição em s na saída)
+    tracks = [[src, start, end, at, volume, speed], ...]  (at = posição em s na saída)
     """
     base = safe_path(p["input"]) if p.get("input") else None
     tracks = [(safe_path(x[0]), float(x[1]), float(x[2]), float(x[3]),
-               float(x[4]) if len(x) > 4 else 1.0) for x in p["tracks"]]
+               float(x[4]) if len(x) > 4 else 1.0,
+               float(x[5]) if len(x) > 5 else 1.0) for x in p["tracks"]]
     out = safe_path(p["output"])
     fmt = p.get("format") or os.path.splitext(out)[1].lstrip(".") or "mp4"
 
@@ -890,19 +899,20 @@ def op_mix_audio(p):
         inputs += ["-i", base]
     else:                                       # projeto só de áudio: base preta
         base_dur = float(p.get("base_duration") or 0) or max(
-            (at + (e - s) for _, s, e, at, _v in tracks), default=1.0)
+            (at + (e - s) / sp for _, s, e, at, _v, sp in tracks), default=1.0)
         base_has_audio = False
         inputs += ["-f", "lavfi", "-t", f"{base_dur:.3f}",
                    "-i", "color=c=black:s=1280x720:r=30"]
     labels, filters = [], []
     if base_has_audio:
         labels.append("[0:a]")
-    for k, (src, s, e, at, vol) in enumerate(tracks, start=1):
+    for k, (src, s, e, at, vol, speed) in enumerate(tracks, start=1):
         inputs += ["-ss", f"{s}", "-to", f"{e}", "-i", src]
         ms = int(round(at * 1000))
         volf = f"volume={vol:.4f}," if abs(vol - 1.0) > 1e-6 else ""
+        tempof = f"{atempo_chain(speed)}," if abs(speed - 1.0) > 1e-6 else ""
         # adelay atrasa cada trilha até sua posição na linha do tempo da saída
-        filters.append(f"[{k}:a]{volf}adelay={ms}|{ms},aresample=48000[a{k}]")
+        filters.append(f"[{k}:a]{volf}{tempof}adelay={ms}|{ms},aresample=48000[a{k}]")
         labels.append(f"[a{k}]")
     n = len(labels)
     # normalize=0 preserva os níveis (amix por padrão divide pela contagem)
@@ -933,10 +943,11 @@ def op_overlay_images(p):
 
     input  = vídeo-base (temporário, apagado ao fim); sem input, gera uma base
              preta de base_duration s (projeto sem vídeo).
-    images = [[src, at, dur], ...]
+    images = [[src, at, dur, opacity], ...]
     """
     base = safe_path(p["input"]) if p.get("input") else None
-    images = [(safe_path(x[0]), float(x[1]), float(x[2])) for x in p["images"]]
+    images = [(safe_path(x[0]), float(x[1]), float(x[2]),
+               float(x[3]) if len(x) > 3 else 1.0) for x in p["images"]]
     if not images:
         raise ValueError("nenhuma imagem para gravar")
     out = safe_path(p["output"])
@@ -957,11 +968,14 @@ def op_overlay_images(p):
                 "-i", f"color=c=black:s={W}x{H}:r=30"]
 
     filters, prev = [], "[0:v]"
-    for k, (src, at, d) in enumerate(images, start=1):
+    for k, (src, at, d, op) in enumerate(images, start=1):
         # imagem vira stream contínuo p/ o overlay; o -t limita o loop à duração
         # da base — sem ele o input é infinito e o ffmpeg nunca encerra
         cmd += ["-loop", "1", "-t", f"{dur:.3f}", "-i", src]
-        filters.append(f"[{k}:v]scale={W}:{H}:force_original_aspect_ratio=decrease[im{k}]")
+        # opacidade < 100%: converte p/ RGBA e reduz o canal alfa — o overlay
+        # já mistura com o fundo conforme o alfa da imagem por cima
+        opf = f",format=rgba,colorchannelmixer=aa={op:.4f}" if abs(op - 1.0) > 1e-6 else ""
+        filters.append(f"[{k}:v]scale={W}:{H}:force_original_aspect_ratio=decrease{opf}[im{k}]")
         filters.append(f"{prev}[im{k}]overlay=(W-w)/2:(H-h)/2:"
                        f"enable='between(t,{at:.3f},{at + d:.3f})'[v{k}]")
         prev = f"[v{k}]"
@@ -1107,6 +1121,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(entries)
             except (PermissionError, FileNotFoundError) as e:
                 return self._json({"error": str(e)}, 403)
+
+        if route == "/api/backgrounds":
+            # lista as variantes de fundo do app (icons/backgowndN.jpg) — quem
+            # decide qual usar é o front (localStorage), aqui só descobrimos quais existem
+            icons_dir = os.path.join(ROOT, "icons")
+            names = [n for n in os.listdir(icons_dir) if BG_RE.match(n)]
+            names.sort(key=lambda n: int(BG_RE.match(n).group(1)))
+            return self._json({"backgrounds": names})
 
         if route == "/api/probe":
             try:

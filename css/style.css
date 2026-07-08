@@ -10,16 +10,13 @@
 
 /* grade: rail | painel de mídia | centro | propriedades (4/5), timeline (1/5) */
 body {
-  /* a imagem É o fundo do app agora (substitui o roxo); um véu preto BAIXO
-     (não mais o roxo) só o suficiente pra manter o texto claro legível */
-  background-color: #000;
-  background-image:
-    linear-gradient(rgba(0, 0, 0, .4), rgba(0, 0, 0, .4)),
-    url("/icons/backgownd.jpg");
-  background-size: cover, cover;
-  background-position: center, center;
-  background-repeat: no-repeat, no-repeat;
-  background-attachment: fixed, fixed;
+  /* a imagem É o fundo do app, sem nenhum véu/cor por cima. --bg-image é
+     escolhida no painel "Fundo" (rail) e persistida no localStorage */
+  background-image: var(--bg-image, url("/icons/backgownd1.jpg"));
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
   color: var(--text);
   font: 14px/1.5 system-ui, sans-serif;
   height: 100vh; overflow: hidden;
@@ -103,11 +100,23 @@ body.no-side #side-resizer { display: none; }
 }
 .side-view::-webkit-scrollbar { display: none; }   /* Chrome */
 .side-view.hidden { display: none; }
-#texts-panel, #trans-panel { padding: 14px 16px; }
-#texts-panel h2, #trans-panel h2 { font-size: 14px; font-weight: 700; margin-bottom: 12px; }
+#texts-panel, #trans-panel, #bg-panel { padding: 14px 16px; }
+#texts-panel h2, #trans-panel h2, #bg-panel h2 { font-size: 14px; font-weight: 700; margin-bottom: 12px; }
 #btn-add-text { width: 100%; justify-content: center; margin-bottom: 12px; }
 .side-note { font-size: 11.5px; color: var(--dim); margin-top: 12px; line-height: 1.45; }
 .trans-row { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+/* grade de miniaturas do fundo do app (aba "Fundo" no rail) */
+#bg-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+  gap: 8px;
+}
+.bg-thumb {
+  aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden; cursor: pointer;
+  border: 2px solid transparent; padding: 0; background: #000;
+}
+.bg-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.bg-thumb:hover { border-color: rgba(122,92,240,.5); }
+.bg-thumb.selected { border-color: var(--accent); }
 #texts-list { list-style: none; display: flex; flex-direction: column; gap: 10px; }
 #texts-list li {
   border: 1px solid var(--line); border-radius: 8px; padding: 8px;
@@ -133,10 +142,14 @@ body.no-side #side-resizer { display: none; }
   color: #fff; background: rgba(0,0,0,.45); padding: .15em .45em;
   border-radius: .18em; white-space: pre; font-weight: 500; max-width: 92%;
   overflow: hidden; text-overflow: ellipsis;
+  pointer-events: auto; cursor: grab; touch-action: none;   /* arrastável livremente */
 }
+#text-overlay .tx:active { cursor: grabbing; }
 #text-overlay .tx.pos-top { top: 8.33%; }
 #text-overlay .tx.pos-center { top: 50%; transform: translate(-50%, -50%); }
 #text-overlay .tx.pos-bottom { bottom: 8.33%; }
+/* posição livre (arrastada): left/top em % vêm inline do JS, ancorados no centro */
+#text-overlay .tx.free { transform: translate(-50%, -50%); }
 
 #browser-head {
   position: sticky; top: 0; z-index: 5; background: var(--panel);
@@ -278,7 +291,7 @@ header h1 { font-size: 15px; font-weight: 700; letter-spacing: .3px; color: #fff
 
 #player-wrap {
   position: relative; flex: 1; min-height: 0;
-  background: #000; margin: 12px 16px 6px; border-radius: 6px;
+  background: #000;   /* ocupa 100% da área central, sem folga nem cantos arredondados */
 }
 #player-wrap video { width: 100%; height: 100%; display: block; object-fit: contain; }
 #player-wrap video.standby { display: none; }   /* player reserva (pré-carga da troca) */
@@ -346,11 +359,11 @@ body:not(.has-props) #props { display: none; }
   font-variant-numeric: tabular-nums;
 }
 #btn-reset-adjust { width: 100%; justify-content: center; margin-top: 14px; }
-/* com um clipe de áudio selecionado, só Volume faz sentido nos Ajustes;
-   com imagem, nenhum ajuste (duração ajusta-se pela borda do clipe na timeline) */
-body.audio-sel #row-speed, body.audio-sel #row-op, body.audio-sel #btn-reset-adjust,
-body.image-sel #row-speed, body.image-sel #row-op, body.image-sel #row-vol,
-body.image-sel #props h3, body.image-sel #btn-reset-adjust { display: none; }
+/* Ajustes por tipo de faixa: vídeo tem os 3 (Velocidade/Volume/Opacidade);
+   áudio não tem Opacidade (não é visual); imagem só tem Opacidade (duração
+   ajusta-se arrastando a borda do clipe na timeline, não por slider) */
+body.audio-sel #row-op { display: none; }
+body.image-sel #row-speed, body.image-sel #row-vol { display: none; }
 #atrack { display: none; }
 /* alça de redimensionamento na borda esquerda do painel de propriedades */
 #props { position: relative; }
