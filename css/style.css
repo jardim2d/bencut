@@ -12,7 +12,7 @@
 body {
   /* a imagem É o fundo do app, sem nenhum véu/cor por cima. --bg-image é
      escolhida no painel "Fundo" (rail) e persistida no localStorage */
-  background-image: var(--bg-image, url("/icons/backgownd1.jpg"));
+  background-image: var(--bg-image, url("/icons/backgownd1.webp"));
   background-size: cover;
   background-position: center;
   background-repeat: no-repeat;
@@ -451,4 +451,63 @@ body.image-sel #row-speed, body.image-sel #row-vol { display: none; }
 #timeline.drag-over {
   border-color: var(--accent); border-style: dashed;
   box-shadow: inset 0 0 0 1px var(--accent), 0 0 12px rgba(122,92,240,.4);
+}
+
+/* ── painel de gravação de tela ── */
+#record-panel { padding: 14px 16px; }
+.rec-inner { display: flex; flex-direction: column; gap: 14px; }
+#record-panel h2 { font-size: 14px; font-weight: 700; }
+.rec-section { display: flex; flex-direction: column; gap: 6px; }
+.rec-label { font-size: 11px; font-weight: 700; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; }
+.rec-radio-group { display: flex; flex-direction: column; gap: 5px; }
+.rec-radio-group label { display: flex; align-items: center; gap: 7px; font-size: 13px; cursor: pointer; }
+#rec-aspect-btns { display: flex; gap: 5px; flex-wrap: wrap; }
+.rec-asp {
+  padding: 4px 10px; font-size: 12px; font-weight: 600;
+  border: 1px solid #4a4060; background: var(--panel2); border-radius: 5px; color: var(--dim);
+}
+.rec-asp:hover { border-color: var(--accent); color: var(--text); }
+.rec-asp.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.rec-audio-label { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.rec-btn-start, .rec-btn-stop {
+  width: 100%; justify-content: center; padding: 10px; font-size: 13px; font-weight: 700;
+}
+.rec-btn-start { background: var(--accent); border-color: var(--accent); color: #fff; }
+.rec-btn-start:hover:not(:disabled) { background: var(--accent-dark); }
+.rec-btn-stop { background: var(--err); border-color: var(--err); color: #fff; }
+.rec-btn-stop:hover:not(:disabled) { background: #c74d43; border-color: #c74d43; }
+.rec-btn-start:disabled { opacity: .5; }
+.rec-status-row {
+  display: flex; align-items: center; gap: 8px; font-size: 13px;
+  background: rgba(0,0,0,.2); border: 1px solid var(--line); border-radius: 7px; padding: 8px 12px;
+}
+.rec-status-row.hidden { display: none; }
+.rec-dot {
+  width: 10px; height: 10px; border-radius: 50%; background: var(--dim); flex-shrink: 0;
+}
+.rec-dot.pulsing {
+  background: var(--err);
+  animation: rec-pulse 1.2s ease-in-out infinite;
+}
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .3; }
+}
+#rec-time { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--dim); }
+.rec-result-row {
+  display: flex; flex-direction: column; gap: 8px;
+  background: rgba(88,181,107,.08); border: 1px solid rgba(88,181,107,.3);
+  border-radius: 7px; padding: 10px 12px;
+}
+.rec-result-row.hidden { display: none; }
+.rec-result-msg { font-size: 13px; font-weight: 700; color: var(--ok); }
+.rec-result-file { font-size: 11px; color: var(--dim); word-break: break-all; }
+#btn-rec-add { justify-content: center; }
+.rec-hotkey-hint {
+  font-size: 11px; color: var(--dim); text-align: center; margin: 0;
+}
+.rec-hotkey-hint kbd {
+  font-family: inherit; font-size: 11px; font-weight: 700;
+  background: rgba(255,255,255,.07); border: 1px solid var(--line);
+  border-radius: 4px; padding: 1px 5px; color: var(--text);
 }

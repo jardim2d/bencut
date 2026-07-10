@@ -42,6 +42,14 @@
     </svg>
     <span>Fundo</span>
   </button>
+  <button id="rail-record" class="rail-btn" data-view="record-panel" title="Gravar a tela">
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor"
+         stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="8"/>
+      <circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/>
+    </svg>
+    <span>Gravar</span>
+  </button>
 </nav>
 
 <!-- painel lateral de mídia: topo → 4/5 da tela -->
@@ -82,6 +90,37 @@
     <h2>Fundo do app</h2>
     <div id="bg-grid"></div>
     <p class="side-note">Só muda a aparência do editor — não entra no vídeo exportado.</p>
+  </div>
+  <div id="record-panel" class="side-view hidden">
+  <div class="rec-inner">
+    <div class="rec-section">
+      <div id="rec-aspect-btns">
+        <button class="rec-asp active" data-asp="16:9">16:9</button>
+        <button class="rec-asp" data-asp="4:3">4:3</button>
+        <button class="rec-asp" data-asp="1:1">1:1</button>
+        <button class="rec-asp" data-asp="9:16">9:16</button>
+        <button class="rec-asp" data-asp="">Livre</button>
+        <button class="rec-asp" data-asp="" data-full="1">Tela inteira</button>
+      </div>
+    </div>
+    <div class="rec-section">
+      <label class="rec-audio-label">
+        <input type="checkbox" id="rec-audio"> Capturar áudio do microfone
+      </label>
+    </div>
+    <button id="btn-rec-start" class="rec-btn-start">Iniciar Gravação</button>
+    <div id="rec-status-row" class="rec-status-row hidden">
+      <span id="rec-dot" class="rec-dot"></span>
+      <span id="rec-status-label">Gravando</span>
+      <span id="rec-time"></span>
+    </div>
+    <p class="rec-hotkey-hint hidden" id="rec-hotkey-hint">Use o botão flutuante para parar de qualquer janela</p>
+    <div id="rec-result-row" class="rec-result-row hidden">
+      <p class="rec-result-msg">Gravação salva</p>
+      <p id="rec-result-file" class="rec-result-file"></p>
+      <button id="btn-rec-add" class="primary">+ Adicionar à timeline</button>
+    </div>
+  </div>
   </div>
   <div id="side-resizer" title="Arraste para redimensionar · duplo clique restaura"></div>
 </aside>

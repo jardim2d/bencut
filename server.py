@@ -4,11 +4,13 @@
 Uso: python3 server.py  →  http://localhost:8765
 """
 import bisect
+import datetime
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import urllib.parse
@@ -44,11 +46,16 @@ os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
 
 FFMPEG = shutil.which("ffmpeg") or os.path.join(HOME, ".local/bin/ffmpeg")
 FFPROBE = shutil.which("ffprobe") or os.path.join(HOME, ".local/bin/ffprobe")
+WF_RECORDER = shutil.which("wf-recorder") or ""
+SLURP = shutil.which("slurp") or ""
 
 # jobs[id] = {status, progress, output, error, op}
 jobs = {}
 jobs_lock = threading.Lock()
 procs = {}   # job_id -> Popen do ffmpeg em execução (para cancelamento)
+
+record_state = {'active': False, 'file': None, 'proc': None, 'overlay': None}
+record_lock = threading.Lock()
 
 
 def has_nvenc():
@@ -1093,6 +1100,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"nvenc": NVENC, "startDir": START_DIR,
                                "ffmpeg": FFMPEG})
 
+        if route == "/api/record/status":
+            with record_lock:
+                active = record_state['active']
+                proc   = record_state.get('proc')
+                fpath  = record_state['file']
+            if active and proc and proc.poll() is not None:
+                # processo morreu (parada externa via Ctrl+Alt+Shift+R)
+                with record_lock:
+                    record_state['active'] = False
+                active = False
+            return self._json({'recording': active, 'file': fpath})
+
         if route == "/api/list":
             try:
                 d = safe_path(q.get("dir", [START_DIR])[0])
@@ -1331,6 +1350,117 @@ class Handler(BaseHTTPRequestHandler):
                 op = body["op"]
                 job_id = OPS[op](body)
                 return self._json({"job": job_id})
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
+        if self.path == "/api/record/start":
+            try:
+                with record_lock:
+                    if record_state['active']:
+                        return self._json({"error": "já está gravando"}, 400)
+                aspect = body.get("aspect") or None
+                fullscreen = bool(body.get("fullscreen", False))
+                vid_dir = os.path.join(HOME, "Vídeos")
+                os.makedirs(vid_dir, exist_ok=True)
+                ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                # sem extensão — o GNOME adiciona automaticamente
+                template = os.path.join(vid_dir, f"BenCut_{ts}")
+                REC_OUT = "/tmp/bencut_rec_out.txt"
+                if os.path.exists(REC_OUT):
+                    os.remove(REC_OUT)
+                area_arg = "fullscreen"
+                if not fullscreen:
+                    sel_cmd = ["python3", os.path.join(ROOT, "screen_select.py")]
+                    if aspect:
+                        sel_cmd.append(aspect)
+                    sel = subprocess.run(
+                        sel_cmd, capture_output=True, text=True,
+                        timeout=120, env=os.environ)
+                    SEL_LOG = "/tmp/bencut_sel.log"
+                    with open(SEL_LOG, "w") as _lf:
+                        _lf.write(f"cmd: {sel_cmd}\nreturncode: {sel.returncode}\nstdout: {sel.stdout!r}\nstderr: {sel.stderr!r}\n")
+                    if sel.returncode != 0:
+                        detail = sel.stderr.strip() if sel.stderr.strip() else "Seleção cancelada"
+                        return self._json({"error": detail}, 400)
+                    geo = sel.stdout.strip()        # "x,y WxH"
+                    xy, wh = geo.split()
+                    x, y = xy.split(",")
+                    w, h = wh.split("x")
+                    area_arg = f"{x},{y},{w},{h}"
+                ERR_FILE = "/tmp/bencut_rec_err.txt"
+                rec_proc = subprocess.Popen(
+                    ["python3", os.path.join(ROOT, "screen_recorder.py"),
+                     "start", template, area_arg],
+                    env=os.environ,
+                    stderr=open(ERR_FILE, "w"))
+                # aguarda o script confirmar início (cria o arquivo de saída)
+                import time
+                for _ in range(50):
+                    if os.path.exists(REC_OUT):
+                        break
+                    if rec_proc.poll() is not None:
+                        err = ""
+                        try:
+                            with open(ERR_FILE) as ef:
+                                err = ef.read().strip()
+                        except Exception:
+                            pass
+                        return self._json({"error": err or "falha ao iniciar gravação"}, 400)
+                    time.sleep(0.1)
+                else:
+                    rec_proc.terminate()
+                    return self._json({"error": "timeout ao iniciar gravação"}, 400)
+                with open(REC_OUT) as f:
+                    actual_file = f.read().strip()
+                overlay_proc = subprocess.Popen(
+                    ["python3", os.path.join(ROOT, "rec_overlay.py"), str(PORT)],
+                    env=os.environ,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                with record_lock:
+                    record_state['active'] = True
+                    record_state['file'] = actual_file
+                    record_state['proc'] = rec_proc
+                    record_state['overlay'] = overlay_proc
+                return self._json({"ok": True, "file": actual_file})
+            except subprocess.TimeoutExpired:
+                return self._json({"error": "Tempo esgotado na seleção"}, 400)
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+
+        if self.path == "/api/record/stop":
+            try:
+                with record_lock:
+                    file_path = record_state['file']
+                    rec_proc = record_state.get('proc')
+                    overlay_proc = record_state.get('overlay')
+                if overlay_proc:
+                    try:
+                        overlay_proc.terminate()
+                    except (ProcessLookupError, OSError):
+                        pass
+                if rec_proc:
+                    try:
+                        rec_proc.send_signal(signal.SIGTERM)
+                    except (ProcessLookupError, OSError):
+                        pass  # processo já encerrou (parada externa)
+                    try:
+                        rec_proc.wait(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        rec_proc.terminate()
+                with record_lock:
+                    record_state['active'] = False
+                    record_state['proc'] = None
+                    record_state['overlay'] = None
+                # aguarda o GStreamer fechar o arquivo antes de remuxar
+                import time; time.sleep(1.0)
+                if file_path and os.path.exists(file_path):
+                    fixed = file_path + ".tmp.webm"
+                    subprocess.run([FFMPEG, "-y", "-i", file_path,
+                                    "-c", "copy", fixed],
+                                   capture_output=True, env=os.environ)
+                    if os.path.exists(fixed) and os.path.getsize(fixed) > 0:
+                        os.replace(fixed, file_path)
+                return self._json({"ok": True, "file": file_path})
             except Exception as e:
                 return self._json({"error": str(e)}, 400)
 

@@ -2499,6 +2499,10 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     togglePlay();
   }
+  else if (e.ctrlKey && e.key === "Escape" && recPhase === 'recording') {
+    e.preventDefault();
+    stopRecordingUI();
+  }
 });
 
 // ---------- render do estado (undo/redo re-renderiza tudo) ----------
@@ -2735,6 +2739,102 @@ $("conv-format").addEventListener("change", () => {
     if (nvenc) gpu.checked = gpuCheckedBeforeWebm;
   }
 });
+
+// ---------- gravação de tela ----------
+let recPhase = 'idle'; // 'idle' | 'selecting' | 'recording'
+let recFile = null;
+let recTimerInterval = null;
+let recPollInterval = null;
+let recElapsed = 0;
+
+async function stopRecordingUI() {
+  if (recPollInterval) { clearInterval(recPollInterval); recPollInterval = null; }
+  if (recTimerInterval) { clearInterval(recTimerInterval); recTimerInterval = null; }
+  try {
+    const r = await api('/api/record/stop', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+    });
+    recFile = r.file;
+  } catch (e) {
+    alert('Erro ao parar: ' + e.message);
+  }
+  recPhase = 'idle';
+  renderRecUI();
+  if (recFile) $('rec-result-file').textContent = recFile.split('/').pop();
+}
+
+for (const btn of document.querySelectorAll('.rec-asp')) {
+  btn.onclick = () => {
+    document.querySelectorAll('.rec-asp').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  };
+}
+
+function renderRecUI() {
+  const idle = recPhase === 'idle';
+  const selecting = recPhase === 'selecting';
+  const recording = recPhase === 'recording';
+  const startBtn = $('btn-rec-start');
+  startBtn.disabled = selecting;
+  if (recording) {
+    startBtn.textContent = '■  Parar Gravação';
+    startBtn.className = 'rec-btn-stop';
+  } else {
+    startBtn.textContent = idle ? '⬤  Iniciar Gravação' : 'Aguardando seleção...';
+    startBtn.className = 'rec-btn-start';
+  }
+  $('rec-status-row').classList.toggle('hidden', !recording);
+  $('rec-dot').classList.toggle('pulsing', recording);
+  $('rec-hotkey-hint').classList.toggle('hidden', !recording);
+  $('rec-result-row').classList.toggle('hidden', !(idle && recFile));
+}
+
+$('btn-rec-start').onclick = async () => {
+  if (recPhase === 'recording') {
+    await stopRecordingUI();
+    return;
+  }
+  const aspBtn = document.querySelector('.rec-asp.active');
+  const fullscreen = !!aspBtn?.dataset.full;
+  const aspect = (!fullscreen && aspBtn?.dataset.asp) ? aspBtn.dataset.asp : null;
+  const audio = $('rec-audio').checked;
+  recPhase = 'selecting';
+  recFile = null;
+  renderRecUI();
+  try {
+    const r = await api('/api/record/start', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({aspect, audio, fullscreen}),
+    });
+    recPhase = 'recording';
+    recElapsed = 0;
+    $('rec-time').textContent = fmtTime(0);
+    recTimerInterval = setInterval(() => {
+      recElapsed++;
+      $('rec-time').textContent = fmtTime(recElapsed);
+    }, 1000);
+    // polling: detecta parada externa (Ctrl+Alt+Shift+R)
+    recPollInterval = setInterval(async () => {
+      try {
+        const s = await api('/api/record/status');
+        if (!s.recording && recPhase === 'recording') {
+          await stopRecordingUI();
+        }
+      } catch {}
+    }, 2000);
+    renderRecUI();
+  } catch (e) {
+    recPhase = 'idle';
+    renderRecUI();
+    alert('Erro: ' + e.message);
+  }
+};
+
+$('btn-rec-add').onclick = () => {
+  if (recFile) addToTimeline(recFile);
+};
+
+renderRecUI();
 
 // ---------- init ----------
 (async () => {
