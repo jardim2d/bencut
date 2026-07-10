@@ -1109,28 +1109,181 @@ function imageIdxAtVisible(vt, lane) {
 }
 
 // espelha o export: mostra sobre o player as imagens ativas no tempo visível.
-// Reconciliação por chave (índice:src) para não recriar/re-baixar o <img> a
-// cada frame do timeupdate.
+// Cada imagem vive num .img-wrap > .img-inner com transform CSS (mover/girar/escalar).
 function syncImageOverlay(vt) {
   const ov = $("image-overlay");
+  // dimensões do overlay para limitar o tamanho natural da imagem
+  const ovW = ov.clientWidth, ovH = ov.clientHeight;
+  ov.style.setProperty("--ov-w", ovW + "px");
+  ov.style.setProperty("--ov-h", ovH + "px");
+
   const active = [];
   if (vt != null) state.imageTrack.forEach((c, i) => {
-    if (vt >= c.at && vt < c.at + c.duration) active.push([i + ":" + c.src, c.opacity ?? 1]);
+    if (vt >= c.at && vt < c.at + c.duration) active.push(i);
   });
-  const wantKeys = active.map(([key]) => key);
+
+  const wantKeys = new Set(active.map(i => i + ":" + state.imageTrack[i].src));
   for (const el of [...ov.children])
-    if (!wantKeys.includes(el.dataset.key)) el.remove();
-  for (const [key, op] of active) {
-    let img = [...ov.children].find(el => el.dataset.key === key);
-    if (!img) {
-      img = document.createElement("img");
-      img.dataset.key = key;
-      img.src = "/api/media?path=" + encodeURIComponent(key.slice(key.indexOf(":") + 1));
-      ov.appendChild(img);
+    if (!wantKeys.has(el.dataset.key)) el.remove();
+
+  for (const i of active) {
+    const c = state.imageTrack[i];
+    const key = i + ":" + c.src;
+    let wrap = [...ov.children].find(el => el.dataset.key === key);
+
+    if (!wrap) {
+      wrap = document.createElement("div");
+      wrap.className = "img-wrap";
+      wrap.dataset.key = key;
+      wrap.dataset.idx = String(i);
+
+      const inner = document.createElement("div");
+      inner.className = "img-inner";
+
+      const img = document.createElement("img");
+      img.src = "/api/media?path=" + encodeURIComponent(c.src);
+      img.draggable = false;
+      inner.appendChild(img);
+      wrap.appendChild(inner);
+      ov.appendChild(wrap);
     }
-    img.style.opacity = String(op);
+
+    const inner = wrap.querySelector(".img-inner");
+    const img = wrap.querySelector("img");
+
+    // limitar tamanho natural ao frame (CSS var atualizado acima)
+    img.style.maxWidth = ovW + "px";
+    img.style.maxHeight = ovH + "px";
+    img.style.opacity = String(c.opacity ?? 1);
+
+    // handles: só para a imagem selecionada
+    const sel = i === selectedImage;
+    inner.classList.toggle("active-sel", sel);
+    for (const h of [...inner.querySelectorAll(".img-h,.img-h-rot")]) h.remove();
+    if (sel) {
+      for (const dir of ["nw", "ne", "sw", "se"]) {
+        const h = document.createElement("div");
+        h.className = "img-h " + dir; h.dataset.dir = dir;
+        inner.appendChild(h);
+      }
+      const rh = document.createElement("div");
+      rh.className = "img-h-rot";
+      inner.appendChild(rh);
+    }
+
+    applyImgTransform(inner, c);
   }
 }
+
+// aplica translate/rotate/scale ao .img-inner a partir dos campos do clipe
+function applyImgTransform(inner, c) {
+  const ov = $("image-overlay");
+  const tx = (c.x ?? 0) * ov.clientWidth;
+  const ty = (c.y ?? 0) * ov.clientHeight;
+  inner.style.transform =
+    `translate(${tx}px,${ty}px) rotate(${c.rotation ?? 0}deg) scale(${c.scale ?? 1})`;
+}
+
+// ── drag de imagem no overlay (mover / redimensionar / girar) ──
+let imgDrag = null;
+
+// escuta no document para não depender de bubbling através de pointer-events:none
+document.addEventListener("pointerdown", e => {
+  const inner = e.target.closest(".img-inner");
+  if (!inner) return;
+  const wrap = inner.closest(".img-wrap");
+  if (!wrap) return;
+  const idx = parseInt(wrap.dataset.idx);
+  if (isNaN(idx) || !state.imageTrack[idx]) return;
+
+  // primeira interação: só seleciona, não arrasta
+  if (selectedImage !== idx) {
+    selectedImage = idx; selectedSeg = null; selectedAudio = null;
+    activeTrack = "image";
+    renderState(); drawTimeline();
+    e.preventDefault();
+    return;
+  }
+
+  const c = state.imageTrack[idx];
+  const isRot = e.target.classList.contains("img-h-rot");
+  const isCorner = e.target.classList.contains("img-h");
+  const rect = inner.getBoundingClientRect();
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  const ov = $("image-overlay");
+  const ovRect = ov.getBoundingClientRect();
+
+  if (isRot) {
+    imgDrag = { type: "rotate", idx, cx, cy,
+                startRot: c.rotation ?? 0,
+                startAngle: Math.atan2(e.clientY - cy, e.clientX - cx),
+                live: c.rotation ?? 0 };
+  } else if (isCorner) {
+    imgDrag = { type: "resize", idx, cx, cy,
+                startScale: c.scale ?? 1,
+                startDist: Math.max(1, Math.hypot(e.clientX - cx, e.clientY - cy)),
+                live: c.scale ?? 1 };
+  } else {
+    imgDrag = { type: "move", idx,
+                startX: e.clientX, startY: e.clientY,
+                startImgX: c.x ?? 0, startImgY: c.y ?? 0,
+                ovW: ovRect.width, ovH: ovRect.height,
+                liveX: c.x ?? 0, liveY: c.y ?? 0 };
+  }
+
+  // captura no .img-inner (não no handle), pois handles são removidos/recriados
+  // a cada frame pelo syncImageOverlay — o browser libera a captura automaticamente
+  // ao remover o elemento, o que faria o pointerup nunca chegar ao commitImgDrag.
+  inner.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+
+document.addEventListener("pointermove", e => {
+  if (!imgDrag) return;
+  const { idx } = imgDrag;
+  const c = state.imageTrack[idx];
+  const inner = $("image-overlay").querySelector(`.img-wrap[data-idx="${idx}"] .img-inner`);
+  if (!inner) return;
+
+  if (imgDrag.type === "move") {
+    imgDrag.liveX = imgDrag.startImgX + (e.clientX - imgDrag.startX) / imgDrag.ovW;
+    imgDrag.liveY = imgDrag.startImgY + (e.clientY - imgDrag.startY) / imgDrag.ovH;
+    applyImgTransform(inner, { ...c, x: imgDrag.liveX, y: imgDrag.liveY });
+  } else if (imgDrag.type === "resize") {
+    const dist = Math.hypot(e.clientX - imgDrag.cx, e.clientY - imgDrag.cy);
+    imgDrag.live = Math.max(0.05, imgDrag.startScale * (dist / imgDrag.startDist));
+    applyImgTransform(inner, { ...c, scale: imgDrag.live });
+    const pct = Math.round(imgDrag.live * 100);
+    $("img-scale").value = String(Math.min(300, Math.max(10, pct)));
+    $("img-scale-val").textContent = pct + "%";
+  } else if (imgDrag.type === "rotate") {
+    const angle = Math.atan2(e.clientY - imgDrag.cy, e.clientX - imgDrag.cx);
+    imgDrag.live = imgDrag.startRot + (angle - imgDrag.startAngle) * 180 / Math.PI;
+    applyImgTransform(inner, { ...c, rotation: imgDrag.live });
+    $("img-rot").value = String(Math.max(-180, Math.min(180, Math.round(imgDrag.live))));
+    $("img-rot-val").textContent = Math.round(imgDrag.live) + "°";
+  }
+});
+
+function commitImgDrag() {
+  if (!imgDrag) return;
+  const { idx } = imgDrag;
+  if (imgDrag.type === "move") {
+    const x = imgDrag.liveX, y = imgDrag.liveY;
+    apply(s => { s.imageTrack[idx].x = x; s.imageTrack[idx].y = y; });
+  } else if (imgDrag.type === "resize") {
+    const sc = imgDrag.live;
+    apply(s => { s.imageTrack[idx].scale = sc; });
+  } else if (imgDrag.type === "rotate") {
+    const rot = imgDrag.live;
+    apply(s => { s.imageTrack[idx].rotation = rot; });
+  }
+  imgDrag = null;
+}
+
+document.addEventListener("pointerup", commitImgDrag);
+document.addEventListener("pointercancel", () => { imgDrag = null; });
 
 // encaixe magnético das imagens: início 0, bordas das outras imagens (qualquer
 // lane), dos clipes de áudio e dos trechos de vídeo visíveis
@@ -1205,7 +1358,7 @@ async function addImageClip(path, at) {
   const lane = imageLaneCount();       // nova lane para esta imagem
   const dur = 3;                       // duração padrão: 3 segundos
   const firstMedia = !hasContent();
-  apply(st => st.imageTrack.push({ src: path, at: pos, duration: dur, opacity: 1, track: lane, hue: nextHue() }));
+  apply(st => st.imageTrack.push({ src: path, at: pos, duration: dur, opacity: 1, track: lane, hue: nextHue(), x: 0, y: 0, scale: 1, rotation: 0 }));
   selectedImage = state.imageTrack.length - 1;
   selectedSeg = null;
   selectedAudio = null;
@@ -2198,9 +2351,9 @@ $("seg-op").oninput = () => {
   const v = $("seg-op").value / 100;
   // preview imediato: na imagem selecionada (se visível agora) ajusta o <img>, senão o player
   if (selectedImage != null) {
-    const img = [...$("image-overlay").children]
+    const wrap = [...$("image-overlay").children]
       .find(el => el.dataset.key === selectedImage + ":" + state.imageTrack[selectedImage].src);
-    if (img) img.style.opacity = String(v);
+    if (wrap) wrap.querySelector("img").style.opacity = String(v);
   } else applyOpacity(v);
 };
 $("seg-op").onchange = () => {
@@ -2212,6 +2365,33 @@ $("seg-op").onchange = () => {
   }
   withSelected(i => apply(s => { s.segments[i].opacity = v; }));
 };
+$("img-scale").oninput = () => {
+  if (selectedImage == null) return;
+  const sc = parseInt($("img-scale").value, 10) / 100;
+  $("img-scale-val").textContent = $("img-scale").value + "%";
+  const inner = $("image-overlay")
+    .querySelector(`.img-wrap[data-idx="${selectedImage}"] .img-inner`);
+  if (inner) applyImgTransform(inner, { ...state.imageTrack[selectedImage], scale: sc });
+};
+$("img-scale").onchange = () => {
+  if (selectedImage == null) return;
+  const i = selectedImage, sc = parseInt($("img-scale").value, 10) / 100;
+  apply(s => { s.imageTrack[i].scale = sc; });
+};
+$("img-rot").oninput = () => {
+  if (selectedImage == null) return;
+  const rot = parseInt($("img-rot").value, 10);
+  $("img-rot-val").textContent = rot + "°";
+  const inner = $("image-overlay")
+    .querySelector(`.img-wrap[data-idx="${selectedImage}"] .img-inner`);
+  if (inner) applyImgTransform(inner, { ...state.imageTrack[selectedImage], rotation: rot });
+};
+$("img-rot").onchange = () => {
+  if (selectedImage == null) return;
+  const i = selectedImage, rot = parseInt($("img-rot").value, 10);
+  apply(s => { s.imageTrack[i].rotation = rot; });
+};
+
 $("btn-reset-adjust").onclick = () => {
   if (selectedAudio != null) {
     const i = selectedAudio;
@@ -2220,7 +2400,7 @@ $("btn-reset-adjust").onclick = () => {
   }
   if (selectedImage != null) {
     const i = selectedImage;
-    apply(s => { s.imageTrack[i].opacity = 1; });
+    apply(s => Object.assign(s.imageTrack[i], { opacity: 1, x: 0, y: 0, scale: 1, rotation: 0 }));
     return;
   }
   withSelected(i => apply(s => Object.assign(s.segments[i], { speed: 1, volume: 1, opacity: 1 })));
@@ -2382,7 +2562,7 @@ async function loadProject(path) {
 $("btn-export-cancel").onclick = () => setExportOptsVisible(false);
 $("btn-export-go").onclick = async () => {
   const kept = state.segments.filter(s => !s.deleted);
-  const images = state.imageTrack.map(c => [c.src, c.at, c.duration, c.opacity ?? 1]);
+  const images = state.imageTrack.map(c => [c.src, c.at, c.duration, c.opacity ?? 1, c.x ?? 0, c.y ?? 0, c.scale ?? 1, c.rotation ?? 0]);
   const audios = state.audioTrack.map(c => [c.src, c.start, c.end, c.at, c.volume ?? 1, c.speed ?? 1]);
   // projeto SEM vídeo: base preta com as imagens gravadas e/ou mix das trilhas
   if (!kept.length) {
@@ -2579,6 +2759,12 @@ function renderState() {
     $("seg-op").disabled = false;
     const iop = Math.round((imageSel.opacity ?? 1) * 100);
     $("seg-op").value = iop; $("seg-op-val").textContent = iop + "%";
+    const isc = Math.round((imageSel.scale ?? 1) * 100);
+    $("img-scale").value = String(Math.min(300, Math.max(10, isc)));
+    $("img-scale-val").textContent = isc + "%";
+    const irot = Math.round(imageSel.rotation ?? 0);
+    $("img-rot").value = String(Math.max(-180, Math.min(180, irot)));
+    $("img-rot-val").textContent = irot + "°";
     $("btn-reset-adjust").disabled = false;
   } else if (audioSel) {
     const inf = sources.get(audioSel.src)?.info;

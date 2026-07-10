@@ -302,6 +302,7 @@ header h1 { font-size: 15px; font-weight: 700; letter-spacing: .3px; color: #fff
 #player-empty {
   position: absolute; inset: 0; display: flex; align-items: center;
   justify-content: center; color: var(--dim);
+  pointer-events: none;   /* é só uma dica: não pode engolir cliques das imagens abaixo */
 }
 #player-wrap.has-video #player-empty { display: none; }
 /* pré-visualização de imagem: cobre a área do player */
@@ -312,13 +313,48 @@ header h1 { font-size: 15px; font-weight: 700; letter-spacing: .3px; color: #fff
 #player-wrap.showing-image #img-preview { display: block; }
 #player-wrap.showing-image video,
 #player-wrap.showing-image #player-empty { display: none; }
-/* imagens da timeline sobre o vídeo (espelha o overlay gravado no export:
-   centralizada, escalada para caber no quadro) */
-#image-overlay { position: absolute; inset: 0; pointer-events: none; border-radius: 6px; overflow: hidden; }
-#image-overlay img {
-  position: absolute; inset: 0; margin: auto;
-  max-width: 100%; max-height: 100%;
+/* imagens da timeline sobre o vídeo */
+#image-overlay { position: absolute; inset: 0; pointer-events: none; border-radius: 6px; }
+
+/* wrapper por imagem: preenche o overlay, centraliza o conteúdo via flex */
+.img-wrap { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+
+/* container transformável: recebe translate/rotate/scale via JS */
+.img-inner {
+  position: relative; flex-shrink: 0;
+  transform-origin: center center;
+  cursor: grab; user-select: none;
+  pointer-events: auto;   /* explícito: funciona mesmo com o pai tendo pointer-events:none */
 }
+.img-inner:active { cursor: grabbing; }
+.img-inner img { display: block; pointer-events: none; -webkit-user-drag: none; }
+.img-inner.active-sel { outline: 1.5px solid #a78bfa; outline-offset: 2px; }
+
+/* handles de redimensionamento nos 4 cantos */
+.img-h {
+  position: absolute; width: 10px; height: 10px;
+  background: #fff; border: 1.5px solid #a78bfa; border-radius: 2px; box-sizing: border-box;
+}
+.img-h.nw { top: -5px; left: -5px; cursor: nwse-resize; }
+.img-h.ne { top: -5px; right: -5px; cursor: nesw-resize; }
+.img-h.sw { bottom: -5px; left: -5px; cursor: nesw-resize; }
+.img-h.se { bottom: -5px; right: -5px; cursor: nwse-resize; }
+
+/* handle de rotação: círculo acima do centro + linha de conexão */
+.img-h-rot {
+  position: absolute; width: 10px; height: 10px;
+  background: #fff; border: 1.5px solid #a78bfa; border-radius: 50%;
+  top: -26px; left: calc(50% - 5px); cursor: crosshair; box-sizing: border-box;
+}
+.img-h-rot::before {
+  content: ''; position: absolute;
+  width: 1.5px; height: 14px; background: #a78bfa;
+  left: 50%; margin-left: -0.75px; top: 10px;
+}
+
+/* linhas de escala/rotação no painel: só visíveis com imagem selecionada */
+.image-only { display: none; }
+body.image-sel .image-only { display: flex; }
 /* cobre o vídeo com preto durante as lacunas (reprodução e scrub) */
 #gap-overlay {
   position: absolute; inset: 0; background: #000; display: none;

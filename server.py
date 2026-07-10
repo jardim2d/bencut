@@ -7,6 +7,7 @@ import bisect
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -953,8 +954,14 @@ def op_overlay_images(p):
     images = [[src, at, dur, opacity], ...]
     """
     base = safe_path(p["input"]) if p.get("input") else None
-    images = [(safe_path(x[0]), float(x[1]), float(x[2]),
-               float(x[3]) if len(x) > 3 else 1.0) for x in p["images"]]
+    def _parse_img(x):
+        return (safe_path(x[0]), float(x[1]), float(x[2]),
+                float(x[3]) if len(x) > 3 else 1.0,   # opacity
+                float(x[4]) if len(x) > 4 else 0.0,   # x offset (fração do frame)
+                float(x[5]) if len(x) > 5 else 0.0,   # y offset
+                float(x[6]) if len(x) > 6 else 1.0,   # scale
+                float(x[7]) if len(x) > 7 else 0.0)   # rotation (graus)
+    images = [_parse_img(x) for x in p["images"]]
     if not images:
         raise ValueError("nenhuma imagem para gravar")
     out = safe_path(p["output"])
@@ -969,22 +976,49 @@ def op_overlay_images(p):
         has_audio = bool(info["audio"])
         cmd += ["-i", base]
     else:
-        dur = float(p.get("base_duration") or 0) or max(at + d for _, at, d in images)
+        dur = float(p.get("base_duration") or 0) or max(at + d for _, at, d, *_ in images)
         W, H, has_audio = 1920, 1080, False
         cmd += ["-f", "lavfi", "-t", f"{dur:.3f}",
                 "-i", f"color=c=black:s={W}x{H}:r=30"]
 
     filters, prev = [], "[0:v]"
-    for k, (src, at, d, op) in enumerate(images, start=1):
-        # imagem vira stream contínuo p/ o overlay; o -t limita o loop à duração
-        # da base — sem ele o input é infinito e o ffmpeg nunca encerra
+    for k, (src, at, d, op, ix, iy, iscale, irot) in enumerate(images, start=1):
         cmd += ["-loop", "1", "-t", f"{dur:.3f}", "-i", src]
-        # opacidade < 100%: converte p/ RGBA e reduz o canal alfa — o overlay
-        # já mistura com o fundo conforme o alfa da imagem por cima
-        opf = f",format=rgba,colorchannelmixer=aa={op:.4f}" if abs(op - 1.0) > 1e-6 else ""
-        filters.append(f"[{k}:v]scale={W}:{H}:force_original_aspect_ratio=decrease{opf}[im{k}]")
-        filters.append(f"{prev}[im{k}]overlay=(W-w)/2:(H-h)/2:"
-                       f"enable='between(t,{at:.3f},{at + d:.3f})'[v{k}]")
+
+        sw = round(W * iscale)
+        sh = round(H * iscale)
+        need_alpha = abs(op - 1.0) > 1e-6 or abs(irot) > 1e-4
+
+        # escala; só converte para RGBA quando realmente necessário (opacidade ou rotação)
+        if need_alpha:
+            filters.append(
+                f"[{k}:v]scale={sw}:{sh}:force_original_aspect_ratio=decrease,"
+                f"format=rgba[imsc{k}]")
+        else:
+            filters.append(
+                f"[{k}:v]scale={sw}:{sh}:force_original_aspect_ratio=decrease[imsc{k}]")
+
+        prev_img = f"[imsc{k}]"
+
+        # opacidade parcial: reduz canal alfa
+        if abs(op - 1.0) > 1e-6:
+            filters.append(f"[imsc{k}]colorchannelmixer=aa={op:.4f}[imop{k}]")
+            prev_img = f"[imop{k}]"
+
+        # rotação: expande o bounding box, fundo transparente
+        if abs(irot) > 1e-4:
+            r_rad = irot * math.pi / 180
+            filters.append(
+                f"{prev_img}rotate={r_rad:.6f}:"
+                f"ow=rotw(iw):oh=roth(ih):fillcolor=black@0[imr{k}]")
+            prev_img = f"[imr{k}]"
+
+        # posição: centro + offset do usuário (ix/iy em fração do frame)
+        x_expr = f"(W-w)/2+{ix:.6f}*W"
+        y_expr = f"(H-h)/2+{iy:.6f}*H"
+        filters.append(
+            f"{prev}{prev_img}overlay={x_expr}:{y_expr}:"
+            f"enable='between(t,{at:.3f},{at + d:.3f})'[v{k}]")
         prev = f"[v{k}]"
     filters.append(f"{prev}format=yuv420p[vout]")
     graph = ";".join(filters)
