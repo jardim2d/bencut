@@ -33,7 +33,8 @@
      inkscape:current-layer="svg1" />
   <g
      id="g2"
-     transform="matrix(1.1408474,0,0,1.1408474,-5.6338401,-5.6338449)">
+     transform="matrix(1.1408474,0,0,1.1408474,-5.6338401,-5.6338449)"
+     style="stroke-width:5.25924852">
     <g
        fill="none"
        stroke="#ffffff"
@@ -41,21 +42,25 @@
        stroke-linecap="round"
        stroke-linejoin="round"
        id="g1"
-       transform="scale(3.3333)">
+       transform="scale(3.3333)"
+       style="stroke-width:1.57779033">
       <!-- nota musical (áudio) -->
       <path
          d="M 9,18 V 5 L 21,3 v 13"
-         id="path1" />
+         id="path1"
+         style="stroke-width:1.57779033" />
       <circle
          cx="6"
          cy="18"
          r="3"
-         id="circle1" />
+         id="circle1"
+         style="stroke-width:1.57779033" />
       <circle
          cx="18"
          cy="16"
          r="3"
-         id="circle2" />
+         id="circle2"
+         style="stroke-width:1.57779033" />
     </g>
   </g>
 </svg>

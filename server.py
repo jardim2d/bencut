@@ -1176,9 +1176,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": str(e)}, 403)
 
         if route == "/api/backgrounds":
-            # lista as variantes de fundo do app (icons/backgowndN.jpg) — quem
+            # lista as variantes de fundo do app (icons/backgownd/) — quem
             # decide qual usar é o front (localStorage), aqui só descobrimos quais existem
-            icons_dir = os.path.join(ROOT, "icons")
+            icons_dir = os.path.join(ROOT, "icons", "backgownd")
             names = [n for n in os.listdir(icons_dir) if BG_RE.match(n)]
             names.sort(key=lambda n: int(BG_RE.match(n).group(1)))
             return self._json({"backgrounds": names})

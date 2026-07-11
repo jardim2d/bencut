@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>BenCut</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
@@ -61,7 +62,24 @@
         <button class="mf-btn" data-kind="audio">Áudio</button>
         <button class="mf-btn" data-kind="image">Imagem</button>
       </div>
-      <div id="browser-path"></div>
+      <div id="browser-path-row">
+        <div id="browser-path"></div>
+        <button id="btn-view-toggle" class="icon" title="Exibir como lista">
+          <svg id="icon-to-list" viewBox="0 0 24 24" width="15" height="15" fill="none"
+               stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <line x1="3" y1="6"  x2="21" y2="6"/>
+            <line x1="3" y1="12" x2="21" y2="12"/>
+            <line x1="3" y1="18" x2="21" y2="18"/>
+          </svg>
+          <svg id="icon-to-grid" viewBox="0 0 24 24" width="15" height="15" fill="none"
+               stroke="currentColor" stroke-width="1.8" class="hidden">
+            <rect x="3"  y="3"  width="7" height="7" rx="1.2"/>
+            <rect x="14" y="3"  width="7" height="7" rx="1.2"/>
+            <rect x="3"  y="14" width="7" height="7" rx="1.2"/>
+            <rect x="14" y="14" width="7" height="7" rx="1.2"/>
+          </svg>
+        </button>
+      </div>
     </div>
     <ul id="browser-list"></ul>
     <div id="browser-grid"></div>
@@ -100,7 +118,7 @@
         <button class="rec-asp" data-asp="1:1">1:1</button>
         <button class="rec-asp" data-asp="9:16">9:16</button>
         <button class="rec-asp" data-asp="">Livre</button>
-        <button class="rec-asp" data-asp="" data-full="1">Tela inteira</button>
+        <button class="rec-asp" data-asp="" data-full="1">Full</button>
       </div>
     </div>
     <div class="rec-section">
@@ -134,7 +152,6 @@
       </svg>
     </div>
     <h1>BenCut</h1>
-    <span id="gpu-badge" class="badge"></span>
     <div class="spacer"></div>
     <button id="btn-undo" class="icon" title="Desfazer (Ctrl+Z)" disabled><img src="/icons/undo.svg" alt="Desfazer"></button>
     <button id="btn-redo" class="icon" title="Refazer (Ctrl+Y)" disabled><img src="/icons/redo.svg" alt="Refazer"></button>
@@ -173,9 +190,9 @@
   <dl id="props-fields">
     <div><dt>Arquivo</dt><dd id="prop-file"></dd></div>
     <div><dt>Duração</dt><dd id="prop-dur"></dd></div>
-    <div><dt>Resolução</dt><dd id="prop-res"></dd></div>
+    <div id="row-res"><dt>Resolução</dt><dd id="prop-res"></dd></div>
     <div><dt>Tamanho</dt><dd id="prop-size"></dd></div>
-    <div><dt>Taxa de quadros</dt><dd id="prop-fps"></dd></div>
+    <div id="row-fps"><dt>Taxa de quadros</dt><dd id="prop-fps"></dd></div>
   </dl>
   <label class="prop-adjust" id="row-speed">Velocidade
     <span class="vol-wrap">
@@ -205,6 +222,13 @@
       <span id="img-scale-val">100%</span>
     </span>
   </label>
+  <label class="prop-adjust vclip-only" id="row-vclip-scale">Escala
+    <span class="vol-wrap">
+      <input type="range" id="vclip-scale" min="10" max="200" step="5" value="100"
+             title="Escala do clipe de vídeo (100% = quadro completo)">
+      <span id="vclip-scale-val">100%</span>
+    </span>
+  </label>
   <label class="prop-adjust image-only" id="row-img-rot">Rotação
     <span class="vol-wrap">
       <input type="range" id="img-rot" min="-180" max="180" step="1" value="0"
@@ -222,24 +246,8 @@
     <button id="btn-play" disabled title="Tocar (Espaço)"></button>
     <button id="btn-cut" disabled title="Dividir o segmento no cursor (tecla C)"><img src="/icons/cut.svg" alt="">Dividir</button>
     <button id="btn-del-seg" class="danger" disabled title="Excluir segmento (tecla Delete)"><img src="/icons/delete.svg" alt="">Excluir</button>
+    <button id="btn-add-lane" title="Adicionar faixa vazia na timeline"><img src="/icons/add.svg" alt="">Faixa</button>
     <button id="btn-extract" disabled title="Extrair áudio do vídeo"><img src="/icons/audio.svg" alt="">Extrair</button>
-    <div id="conv-opts">
-      <label>Formato
-        <select id="conv-format">
-          <option value="mp4" selected>MP4</option>
-          <option value="webm">WebM (VP9)</option>
-        </select>
-      </label>
-      <label>Qualidade
-        <select id="conv-quality">
-          <option value="alta">Alta</option>
-          <option value="media" selected>Média</option>
-          <option value="baixa">Baixa</option>
-        </select>
-      </label>
-      <label id="gpu-label"><span>GPU (NVENC)</span><input type="checkbox" id="conv-gpu" checked></label>
-      <button id="btn-convert" class="primary" disabled><img src="/icons/convert.svg" alt="">Converter</button>
-    </div>
     <span id="mark-info"></span>
     <div id="jobs-bar"></div>
   </div>

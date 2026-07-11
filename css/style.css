@@ -12,7 +12,7 @@
 body {
   /* a imagem É o fundo do app, sem nenhum véu/cor por cima. --bg-image é
      escolhida no painel "Fundo" (rail) e persistida no localStorage */
-  background-image: var(--bg-image, url("/icons/backgownd1.webp"));
+  background-image: var(--bg-image, url("/icons/backgownd/backgownd1.webp"));
   background-size: cover;
   background-position: center;
   background-repeat: no-repeat;
@@ -136,7 +136,7 @@ body.no-side #side-resizer { display: none; }
 #texts-list .t-row .rm { margin-left: auto; }
 
 /* textos sobre o vídeo no preview (posições e tamanho espelham o export) */
-#text-overlay { position: absolute; inset: 0; pointer-events: none; border-radius: 6px; overflow: hidden; }
+#text-overlay { position: absolute; inset: 0; pointer-events: none; border-radius: 6px; overflow: hidden; z-index: 3; }
 #text-overlay .tx {
   position: absolute; left: 50%; transform: translateX(-50%);
   color: #fff; background: rgba(0,0,0,.45); padding: .15em .45em;
@@ -167,8 +167,44 @@ body.no-side #side-resizer { display: none; }
 }
 .mf-btn:hover:not(.active) { color: var(--text); background: rgba(122,92,240,.12); }
 .mf-btn.active { background: var(--accent); color: #fff; }
+#browser-path-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+}
 #browser-path {
-  font-size: 11px; color: var(--dim); word-break: break-all;
+  flex: 1; font-size: 11px; color: var(--dim); word-break: break-all;
+}
+#btn-view-toggle {
+  flex-shrink: 0; padding: 3px 5px;
+  background: none; border-color: transparent; color: var(--dim);
+}
+#btn-view-toggle:hover { color: var(--text); background: rgba(122,92,240,.18); border-color: transparent; }
+
+/* modo lista dos cards de arquivo */
+#browser-grid.list-view {
+  display: flex; flex-direction: column; gap: 0;
+  grid-template-columns: unset; padding: 0 0 14px;
+}
+#browser-grid.list-view .card {
+  display: flex; align-items: center; gap: 9px;
+  padding: 5px 14px; border-radius: 0;
+}
+#browser-grid.list-view .card .thumb {
+  width: 20px; height: 20px; aspect-ratio: unset; flex-shrink: 0; border-radius: 0;
+  background: none;
+}
+#browser-grid.list-view .card .thumb::before { content: none; }
+#browser-grid.list-view .card .thumb-img { display: none; }
+#browser-grid.list-view .card .icon-img {
+  display: block; width: 18px; height: 18px; object-fit: contain;
+  position: relative; opacity: .85;
+}
+#browser-grid.list-view .card .name {
+  flex: 1; margin-top: 0;
+}
+#browser-grid.list-view .card .size { flex-shrink: 0; }
+#browser-grid.list-view .card .dur {
+  position: static; background: none; color: var(--dim); padding: 0;
+  flex-shrink: 0; font-size: 11px;
 }
 #browser-list { list-style: none; padding-bottom: 10px; }
 #browser-list li {
@@ -190,7 +226,7 @@ body.no-side #side-resizer { display: none; }
   display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
   gap: 10px; padding: 6px 12px 14px;
 }
-.card { cursor: grab; border-radius: 8px; padding: 4px; }
+.card { cursor: grab; border-radius: 8px; padding: 4px; position: relative; }
 .card:active { cursor: grabbing; }
 .card:hover { background: rgba(122,92,240,.12); }
 .card.selected { background: rgba(122,92,240,.18); outline: 2px solid var(--accent); }
@@ -203,12 +239,13 @@ body.no-side #side-resizer { display: none; }
   content: "🎞"; position: absolute; font-size: 24px; opacity: .35;
 }
 .card .thumb img { position: relative; width: 100%; height: 100%; object-fit: cover; }
-.card.project .thumb img { object-fit: contain; padding: 16%; }  /* ícone de projeto */
-.card.audio .thumb img { object-fit: contain; padding: 22%; opacity: .85; }
+.card.project .thumb .thumb-img { object-fit: contain; padding: 16%; }
+.card.audio .thumb .thumb-img { object-fit: contain; padding: 22%; opacity: .85; }
+.card .icon-img { display: none; }
 .card.audio .thumb::before { content: "🎵"; }   /* fundo dos cards de áudio */
 .card.image .thumb::before { content: "🖼"; }    /* fundo dos cards de imagem */
 .card .dur {
-  position: absolute; right: 4px; bottom: 4px;
+  position: absolute; right: 8px; bottom: 40px;
   background: rgba(0,0,0,.75); color: #fff;
   font-size: 10.5px; line-height: 1.5; padding: 0 5px; border-radius: 4px;
 }
@@ -314,7 +351,7 @@ header h1 { font-size: 15px; font-weight: 700; letter-spacing: .3px; color: #fff
 #player-wrap.showing-image video,
 #player-wrap.showing-image #player-empty { display: none; }
 /* imagens da timeline sobre o vídeo */
-#image-overlay { position: absolute; inset: 0; pointer-events: none; border-radius: 6px; }
+#image-overlay { position: absolute; inset: 0; pointer-events: none; border-radius: 6px; z-index: 2; }
 
 /* wrapper por imagem: preenche o overlay, centraliza o conteúdo via flex */
 .img-wrap { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
@@ -352,15 +389,58 @@ header h1 { font-size: 15px; font-weight: 700; letter-spacing: .3px; color: #fff
   left: 50%; margin-left: -0.75px; top: 10px;
 }
 
-/* linhas de escala/rotação no painel: só visíveis com imagem selecionada */
+/* linhas de escala/rotação no painel: só visíveis com imagem ou vclip selecionado */
 .image-only { display: none; }
 body.image-sel .image-only { display: flex; }
+.vclip-only { display: none; }
+body.vclip-sel .vclip-only { display: flex; }
 /* cobre o vídeo com preto durante as lacunas (reprodução e scrub) */
 #gap-overlay {
   position: absolute; inset: 0; background: #000; display: none;
   border-radius: 6px; pointer-events: none;
 }
 #gap-overlay.show { display: block; }
+/* wrapper de lane de vídeo livre: posicionável/escalável igual às imagens */
+.vlane-wrap {
+  position: absolute; inset: 0; display: none; pointer-events: none; z-index: 1;
+}
+.vlane-wrap.show { display: block; }
+.vlane-inner {
+  position: absolute; inset: 0;
+  transform-origin: center center;
+  user-select: none;
+  pointer-events: none;
+}
+.vlane-inner.active-sel { pointer-events: auto; cursor: grab; }
+.vlane-inner.active-sel:active { cursor: grabbing; }
+.vlane-inner video {
+  width: 100%; height: 100%; object-fit: cover;
+  display: block; pointer-events: none; background: #000;
+}
+/* moldura de seleção: segue a área visível (inset em % vem do JS = crop) */
+.vlane-box {
+  position: absolute; inset: 0;
+  border: 1.5px solid #a78bfa;
+  pointer-events: none;
+}
+/* alças de canto (escala): posição left/top em % vem do JS */
+.vlane-h {
+  position: absolute; width: 10px; height: 10px;
+  background: #fff; border: 1.5px solid #a78bfa; border-radius: 2px;
+  box-sizing: border-box; pointer-events: auto;
+  transform: translate(-50%, -50%);
+}
+.vlane-h.nw, .vlane-h.se { cursor: nwse-resize; }
+.vlane-h.ne, .vlane-h.sw { cursor: nesw-resize; }
+/* alças de crop no meio das bordas: círculos roxos */
+.vlane-c {
+  position: absolute; width: 11px; height: 11px;
+  background: #a78bfa; border: 1.5px solid #fff; border-radius: 50%;
+  box-sizing: border-box; pointer-events: auto;
+  transform: translate(-50%, -50%);
+}
+.vlane-c.n, .vlane-c.s { cursor: ns-resize; }
+.vlane-c.w, .vlane-c.e { cursor: ew-resize; }
 #file-info { display: none; }
 
 /* ── painel de propriedades (coluna 4; visível só com segmento selecionado) ── */
@@ -369,7 +449,6 @@ body.image-sel .image-only { display: flex; }
   background: rgba(0, 0, 0, .48); border-left: 1px solid var(--line);
   padding: 14px 16px; overflow-y: auto; min-height: 0;
 }
-body:not(.has-props) #props { display: none; }
 #props h2 { font-size: 14px; font-weight: 700; margin-bottom: 12px; }
 #props-fields div {
   display: flex; justify-content: space-between; gap: 10px;
@@ -417,6 +496,9 @@ body:not(.has-props) #props { display: none; }
    ajusta-se arrastando a borda do clipe na timeline, não por slider) */
 body.audio-sel #row-op { display: none; }
 body.image-sel #row-speed, body.image-sel #row-vol { display: none; }
+/* Resolução e FPS não se aplicam a áudio; FPS não se aplica a imagem */
+body.audio-sel #row-res, body.audio-sel #row-fps { display: none; }
+body.image-sel #row-fps { display: none; }
 #atrack { display: none; }
 /* alça de redimensionamento na borda esquerda do painel de propriedades */
 #props { position: relative; }
@@ -463,30 +545,10 @@ body.image-sel #row-speed, body.image-sel #row-vol { display: none; }
 }
 
 #mark-info { font-size: 12px; color: var(--accent-deep); font-weight: 600; }
-#conv-opts { display: flex; gap: 8px; align-items: center; }
-/* grupo de conversão: caixa própria para ler como uma unidade só,
-   com respiro extra dos vizinhos */
-#conv-opts {
-  background: rgba(255,255,255,.04);
-  border: 1px solid var(--line); border-radius: 8px;
-  padding: 4px 10px;
-  margin: 0 42px;
-}
-#conv-opts label {
-  display: flex; gap: 6px; align-items: center; font-size: 12px;
-}
-#conv-opts select { font-size: 12px; padding: 2px 4px; }
-/* toggle GPU oculto: a decisão é automática (NVENC quando disponível; WebM/sem
-   GPU caem p/ CPU). O checkbox segue no DOM porque o JS lê/ajusta seu estado. */
-#conv-opts #gpu-label { display: none; }
 #timeline {
   flex: 1; min-height: 0; width: 100%;
   background: rgba(0,0,0,.25); border: 1px solid var(--line);
   border-radius: 4px; cursor: crosshair; display: block;
-}
-#timeline.drag-over {
-  border-color: var(--accent); border-style: dashed;
-  box-shadow: inset 0 0 0 1px var(--accent), 0 0 12px rgba(122,92,240,.4);
 }
 
 /* ── painel de gravação de tela ── */
