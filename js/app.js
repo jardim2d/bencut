@@ -834,6 +834,33 @@ function updatePlayButton() {
 }
 $("btn-play").onclick = togglePlay;
 
+// ---------- barra de controles do player (substitui os controles nativos,
+// que ficavam sob os vclips por viverem no shadow DOM do <video>) ----------
+let pbarState = null;      // memo: evita reescrever o DOM a cada frame
+let pbarWasPlaying = false;
+function updatePlayerBar() {
+  const dur = timelineDur();
+  const playVis = inTail ? noVidT
+    : gapVisible != null ? gapVisible
+    : hasVideo() && activeSrc ? sourceToVisible(activeSrc, player.currentTime) : noVidT;
+  const playing = isPlaying();
+  const key = playing + ":" + Math.round(playVis * 10) + ":" + Math.round(dur * 10);
+  if (key === pbarState) return;
+  pbarState = key;
+  $("pbar-time").textContent = fmtTime(playVis);
+  $("pbar-dur").textContent = fmtTime(dur);
+  if (!$("pbar-seek").matches(":active"))
+    $("pbar-seek").value = dur > 0 ? Math.round(playVis / dur * 10000) : 0;
+  $("pbar-play").innerHTML = playing ? PAUSE_ICON : PLAY_ICON;
+}
+$("pbar-play").onclick = togglePlay;
+$("pbar-seek").oninput = function () {
+  const dur = timelineDur();
+  if (dur > 0) scrubToVisible(parseFloat(this.value) / 10000 * dur);
+};
+$("pbar-seek").onmousedown = () => { pbarWasPlaying = isPlaying(); if (pbarWasPlaying) pausePlayback(); };
+$("pbar-seek").onmouseup = () => { if (pbarWasPlaying) { playPlayback(); pbarWasPlaying = false; } };
+
 const segKey = (s) => s.src + "@" + s.start.toFixed(3) + ":" + s.end.toFixed(3);
 const keptSegs = () => state.segments.filter(s => !s.deleted);
 // duração VISÍVEL do trecho, já com a aceleração aplicada: um trecho a 2x ocupa
@@ -1783,7 +1810,8 @@ function drawClipIcon(src, x0, midY, clipW) {
 
 function drawTimeline() {
   updatePlayButton();   // mantém o ícone em sincronia mesmo quando o play/pause
-                        // vem de outro lugar (controles nativos, fim natural, tail)
+                        // vem de outro lugar (fim natural, tail)
+  updatePlayerBar();
   const dpr = devicePixelRatio;
   const w = canvas.width = canvas.clientWidth * dpr;
   const h = canvas.height = canvas.clientHeight * dpr;
@@ -3533,6 +3561,7 @@ $("btn-export-go").onclick = async () => {
         prevOut = step.output;
       }
     } else {
+      body.output = picked.path;
       submitJob(body);
       setExportOptsVisible(false);
     }

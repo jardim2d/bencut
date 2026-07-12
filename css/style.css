@@ -330,12 +330,20 @@ header h1 { font-size: 15px; font-weight: 700; letter-spacing: .3px; color: #fff
 #player-wrap {
   position: relative; flex: 1; min-height: 0;
   background: #000;   /* ocupa 100% da área central, sem folga nem cantos arredondados */
+  overflow: hidden;   /* vclips transformados são cortados nas bordas, igual ao export */
 }
 #player-wrap video { width: 100%; height: 100%; display: block; object-fit: contain; }
 #player-wrap video.standby { display: none; }   /* player reserva (pré-carga da troca) */
-/* remove o gradiente/sombra dos controles nativos que escurecia a base do vídeo */
-#player-wrap video::-webkit-media-controls-panel,
-#player-wrap video::-webkit-media-controls-enclosure { background: transparent; }
+/* controles do player (fora do player-wrap: nenhum overlay consegue cobri-los) */
+#player-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 3px 10px; background: rgba(0, 0, 0, .38); border-top: 1px solid var(--line);
+  flex-shrink: 0;
+}
+#player-bar button { background: none; border: none; padding: 2px 4px; }
+#player-bar button img { width: 16px; height: 16px; }
+#pbar-seek { flex: 1; min-width: 0; accent-color: var(--accent); cursor: pointer; }
+#pbar-time, #pbar-dur { font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
 #player-empty {
   position: absolute; inset: 0; display: flex; align-items: center;
   justify-content: center; color: var(--dim);

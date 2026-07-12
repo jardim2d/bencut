@@ -171,14 +171,21 @@
     <button id="btn-export" class="primary" disabled><img src="/icons/export.svg" alt="">Exportar</button>
   </header>
   <div id="player-wrap">
-    <video id="player" controls></video>
-    <video id="player2" controls class="standby"></video>
+    <video id="player"></video>
+    <video id="player2" class="standby"></video>
     <audio id="atrack"></audio>
     <img id="img-preview" alt="">
     <div id="gap-overlay"></div>
     <div id="image-overlay"></div>
     <div id="text-overlay"></div>
     <div id="player-empty">Arraste um vídeo da lista para a timeline abaixo</div>
+  </div>
+  <!-- controles do player: fora do player-wrap para nunca ficarem sob os vclips -->
+  <div id="player-bar">
+    <button id="pbar-play" title="Tocar/Pausar (Espaço)"><img src="/icons/play.svg" alt=""></button>
+    <span id="pbar-time">0:00</span>
+    <input type="range" id="pbar-seek" min="0" max="10000" step="1" value="0">
+    <span id="pbar-dur">0:00</span>
   </div>
   <div id="file-info"></div>
 </section>
