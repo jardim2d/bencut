@@ -96,6 +96,8 @@ const imageLaneCount = () =>
 // nº de lanes de vídeo livre (mesmo padrão)
 const videoLaneCount = () =>
   state.videoTrack.reduce((m, c) => Math.max(m, (c.track || 0) + 1), 0);
+// nº de lanes da seção combinada vídeo+imagem (compartilham o mesmo índice de faixa)
+const vidImgLaneCount = () => Math.max(videoLaneCount(), imageLaneCount());
 // duração NA TIMELINE de um clipe de vídeo livre (encolhe/estica com a velocidade)
 const videoVis = (c) => (c.end - c.start) / (c.speed || 1);
 // fim (em tempo visível) do clipe de vídeo livre mais distante
@@ -312,7 +314,11 @@ function showFileMenu(e, path, name) {
 }
 
 // renomear/deletar quebrariam a edição se o arquivo estiver na timeline
-const fileInTimeline = (path) => state.segments.some(s => !s.deleted && s.src === path);
+const fileInTimeline = (path) =>
+  state.segments.some(s => !s.deleted && s.src === path) ||
+  state.audioTrack.some(c => c.src === path) ||
+  state.imageTrack.some(c => c.src === path) ||
+  state.videoTrack.some(c => c.src === path);
 
 // limpa caches/estado de um arquivo que sumiu (deletado → newPath null) ou mudou
 // de caminho (renomeado); se ele estava só em pré-visualização, esvazia o player
@@ -1110,7 +1116,7 @@ function pauseAllAudioEls() { for (const a of audioEls) if (a && !a.paused) a.pa
 // nº de faixas existentes (vídeo conta como 1, se houver + cada lane de áudio/imagem)
 // ordem vertical das lanes abaixo da faixa principal: vídeo livres, áudio,
 // imagem, extras — a prioridade de EXIBIÇÃO segue essa ordem (a de cima ganha)
-const mediaLaneTotal = () => videoLaneCount() + audioLaneCount() + imageLaneCount();
+const mediaLaneTotal = () => vidImgLaneCount() + audioLaneCount();
 const trackCount = () => (keptSegs().length > 0 ? 1 : 0) + mediaLaneTotal() + (state.extraLanes || 0);
 // altura (px CSS) de UMA faixa: espaço abaixo da régua dividido em partes IGUAIS
 // entre todas as faixas existentes — recalculada a cada chamada, então se ajusta
@@ -1176,13 +1182,12 @@ function extraLaneAt(e) {
 // na última lane de áudio — não cruza p/ o outro tipo de faixa)
 function audioLaneAt(e) {
   const n = audioLaneCount();
-  return n > 0 ? Math.max(0, Math.min(n - 1, mediaLaneAt(e) - videoLaneCount())) : 0;
+  return n > 0 ? Math.max(0, Math.min(n - 1, mediaLaneAt(e) - vidImgLaneCount())) : 0;
 }
-// lane de IMAGEM sob o ponteiro (mesma ideia, prende na 1ª lane de imagem
-// se o ponteiro estiver na área de áudio)
+// lane de IMAGEM sob o ponteiro (seção combinada com vídeo — índice direto)
 function imageLaneAt(e) {
   const n = imageLaneCount();
-  return n > 0 ? Math.max(0, Math.min(n - 1, mediaLaneAt(e) - videoLaneCount() - audioLaneCount())) : 0;
+  return n > 0 ? Math.max(0, Math.min(n - 1, mediaLaneAt(e))) : 0;
 }
 // índice da imagem da lane `lane` no tempo visível vt (-1 se nenhuma)
 function imageIdxAtVisible(vt, lane) {
@@ -1432,8 +1437,8 @@ document.addEventListener("pointermove", e => {
     vlaneDrag.live = Math.max(0.05, vlaneDrag.startScale * (dist / vlaneDrag.startDist));
     applyVlaneTransform(inner, { ...c, scale: vlaneDrag.live });
     const pct = Math.round(vlaneDrag.live * 100);
-    $("vclip-scale").value = String(Math.min(200, Math.max(10, pct)));
-    $("vclip-scale-val").textContent = pct + "%";
+    $("img-scale").value = String(Math.min(300, Math.max(10, pct)));
+    $("img-scale-val").textContent = pct + "%";
   } else if (vlaneDrag.type === "crop") {
     const d = vlaneDrag;
     const delta = d.side === "w" ? (e.clientX - d.px) / d.rectW
@@ -1539,7 +1544,7 @@ async function addVideoClip(path, at, targetLane) {
   const dur = s.info.duration || 0;
   if (dur <= 0 || !s.info.video) return;
   const pos = Math.max(0, at ?? 0);
-  const lane = targetLane ?? videoLaneCount();
+  const lane = targetLane ?? vidImgLaneCount();
   const firstMedia = !hasContent();
   apply(st => st.videoTrack.push(
     { src: path, start: 0, end: dur, at: pos, speed: 1, volume: 1, opacity: 1, track: lane, hue: nextHue(), x: 0, y: 0, scale: 1 }));
@@ -1557,7 +1562,7 @@ async function addImageClip(path, at, targetLane) {
   const s = await ensureSource(path);
   if (!s) return;
   const pos = Math.max(0, at ?? 0);
-  const lane = targetLane ?? imageLaneCount();
+  const lane = targetLane ?? vidImgLaneCount();
   const dur = 3;                       // duração padrão: 3 segundos
   const firstMedia = !hasContent();
   apply(st => st.imageTrack.push({ src: path, at: pos, duration: dur, opacity: 1, track: lane, hue: nextHue(), x: 0, y: 0, scale: 1, rotation: 0 }));
@@ -1630,7 +1635,7 @@ function syncVideoLanes(playVis, mainCovers) {
     const v = inner.querySelector("video");
     const ci = playVis == null ? -1 : vclipIdxAtVisible(playVis, lane);
     const c = ci === -1 ? null : state.videoTrack[ci];
-    wrap.classList.toggle("show", !!c);
+    wrap.classList.toggle("show", !!c && !mainCovers);
     wrap.style.zIndex = nVid - lane;  // lane 0 fica acima
     if (!c) { if (!v.paused) v.pause(); continue; }
     inner.dataset.ci = String(ci);
@@ -1788,12 +1793,13 @@ function drawTimeline() {
   const nVid = videoLaneCount();
   const nAudio = audioLaneCount();
   const nImage = imageLaneCount();
+  const nVidImg = Math.max(nVid, nImage); // seção combinada vídeo+imagem
   const nExtra = state.extraLanes || 0;
   const hasVid = kept.length > 0;
-  const nTracks = (hasVid ? 1 : 0) + nVid + nAudio + nImage + nExtra;
+  const nTracks = (hasVid ? 1 : 0) + nVidImg + nAudio + nExtra;
   const trackH = nTracks > 0 ? (h - rulerH) / nTracks : 0;
   const mediaLaneH = trackH;
-  const mediaAreaTop = h - (nVid + nAudio + nImage + nExtra) * mediaLaneH;
+  const mediaAreaTop = h - (nVidImg + nAudio + nExtra) * mediaLaneH;
   const segTop = rulerH, segH = trackH;
 
   // hover da área de vídeo durante drag
@@ -1852,13 +1858,11 @@ function drawTimeline() {
   const audioActive = activeTrack === "audio";
   const imageActive = activeTrack === "image";
   // fundo das lanes
-  for (let li = 0; li < nVid + nAudio + nImage; li++) {
+  for (let li = 0; li < nVidImg + nAudio; li++) {
     const laneTop = mediaAreaTop + li * mediaLaneH;
-    const laneType = li < nVid ? "vlane" : li < nVid + nAudio ? "audio" : "image";
-    const isActive = laneType === "vlane" ? vclipActive
-                   : laneType === "audio" ? audioActive : imageActive;
-    const laneIdx = laneType === "vlane" ? li
-                  : laneType === "audio" ? li - nVid : li - nVid - nAudio;
+    const laneType = li < nVidImg ? "vidimg" : "audio";
+    const isActive = laneType === "vidimg" ? (vclipActive || imageActive) : audioActive;
+    const laneIdx = laneType === "vidimg" ? li : li - nVidImg;
     const isHover = dragOverLane && dragOverLane.type === laneType && dragOverLane.idx === laneIdx;
     ctx.fillStyle = isHover   ? "rgba(122,92,240,.22)"
                   : isActive  ? "rgba(122,92,240,.12)"
@@ -1883,14 +1887,16 @@ function drawTimeline() {
   }
   // faixas extras: continuam a sequência
   for (let ei = 0; ei < nExtra; ei++) {
-    const laneTop = mediaAreaTop + (nVid + nAudio + nImage + ei) * mediaLaneH;
-    const laneNum = (hasVid ? 1 : 0) + nVid + nAudio + nImage + ei + 1;
+    const laneTop = mediaAreaTop + (nVidImg + nAudio + ei) * mediaLaneH;
+    const laneNum = (hasVid ? 1 : 0) + nVidImg + nAudio + ei + 1;
     if (mediaLaneH > 10 * dpr) drawLaneNum(laneTop + mediaLaneH / 2, String(laneNum), false);
   }
   // clipes de vídeo livre
   for (let i = 0; i < state.videoTrack.length; i++) {
     const c = state.videoTrack[i];
-    const laneTop = mediaAreaTop + (c.track || 0) * mediaLaneH;
+    const laneTop = (vclipMoving && i === vclipMoveIdx && vclipDragY >= 0)
+      ? Math.max(rulerH, Math.min(vclipDragY * dpr - mediaLaneH / 2, h - mediaLaneH))
+      : mediaAreaTop + (c.track || 0) * mediaLaneH;
     const x0 = sx(c.at), wd = videoVis(c) * scale;
     const sel = i === selectedVClip;
     const hue = c.hue ?? 210;
@@ -1912,7 +1918,9 @@ function drawTimeline() {
   // clipes de áudio
   for (let i = 0; i < state.audioTrack.length; i++) {
     const c = state.audioTrack[i];
-    const laneTop = mediaAreaTop + (nVid + (c.track || 0)) * mediaLaneH;
+    const laneTop = (audioMoving && i === audioMoveIdx && audioDragY >= 0)
+      ? Math.max(rulerH, Math.min(audioDragY * dpr - mediaLaneH / 2, h - mediaLaneH))
+      : mediaAreaTop + (nVidImg + (c.track || 0)) * mediaLaneH;
     const x0 = sx(c.at), wd = audioVis(c) * scale;
     const sel = i === selectedAudio;
     const hue = c.hue ?? 158;
@@ -1935,7 +1943,9 @@ function drawTimeline() {
   // bloco na cor do clipe enquanto a miniatura carrega)
   for (let i = 0; i < state.imageTrack.length; i++) {
     const c = state.imageTrack[i];
-    const laneTop = mediaAreaTop + (nVid + nAudio + (c.track || 0)) * mediaLaneH;
+    const laneTop = (imageMoving && i === imageMoveIdx && imageDragY >= 0)
+      ? Math.max(rulerH, Math.min(imageDragY * dpr - mediaLaneH / 2, h - mediaLaneH))
+      : mediaAreaTop + (c.track || 0) * mediaLaneH;
     const x0 = sx(c.at), wd = c.duration * scale;
     const y0 = laneTop + 3 * dpr, hh = mediaLaneH - 6 * dpr;
     const sel = i === selectedImage;
@@ -1972,7 +1982,7 @@ function drawTimeline() {
 
   // faixas extras (vazias, adicionadas pelo usuário)
   for (let ei = 0; ei < nExtra; ei++) {
-    const laneTop = mediaAreaTop + (nVid + nAudio + nImage + ei) * mediaLaneH;
+    const laneTop = mediaAreaTop + (nVidImg + nAudio + ei) * mediaLaneH;
     const sel = ei === selectedEmptyLane;
     const isHover = (dragOverLane?.type === "extra" && dragOverLane.idx === ei)
       || clipDragOverExtra === ei;
@@ -2064,6 +2074,9 @@ let audioDragFrozenLaneH = 0, audioDragOrigTrack = 0, audioDragMaxTrack = 0;
 // arraste de clipe de vídeo livre (muda `at` e pode trocar de lane)
 let vclipMoving = false, vclipMoveIdx = -1, vclipMoveBaseX = 0, vclipMoveOrigAt = 0, vclipMoveHist = false;
 let vclipDragFrozenLaneH = 0, vclipDragOrigTrack = 0, vclipDragMaxTrack = 0;
+// Y do cursor (px CSS do topo do canvas) durante o arraste vertical de clipes
+// (-1 quando não está a arrastar)
+let vclipDragY = -1, audioDragY = -1, imageDragY = -1;
 // faixa extra sob o ponteiro durante o arraste de um clipe (destaque + drop)
 let clipDragOverExtra = null;
 // solta um clipe numa faixa vazia: ganha uma lane própria do seu tipo e a
@@ -2265,61 +2278,40 @@ canvas.addEventListener("pointerdown", (e) => {
     canvas.style.cursor = "ew-resize";
     return;
   }
-  // lanes de vídeo livre/áudio/imagem: descubra o tipo pela posição na área de mídia
+  // lanes de vídeo livre/imagem (seção combinada) e áudio: descubra o tipo pela posição
   if (inMediaLane(e)) {
     const lane = mediaLaneAt(e);
-    const nVid = videoLaneCount();
+    const nVidImg = vidImgLaneCount();
     const nAudio = audioLaneCount();
-    if (lane < nVid) {
-      activeTrack = "vclip";
+    if (lane < nVidImg) {
+      // seção combinada: tanto vclip quanto imagem podem existir no mesmo lane
       const vt = visibleAtEvent(e);
       let vi = vclipIdxAtVisible(vt, lane);
-      // se o clip encontrado já está selecionado, procura outro sobreposto
       if (vi !== -1 && vi === selectedVClip) {
         const alt = state.videoTrack.findIndex((c, j) =>
           j !== selectedVClip && (c.track || 0) === lane &&
           vt >= c.at && vt <= c.at + videoVis(c));
         if (alt !== -1) vi = alt;
       }
-      if (vi !== -1) {
+      const ii = imageIdxAtVisible(vt, lane);
+      // vclip tem prioridade; se já está selecionado, próximo clique vai para a imagem (ciclo)
+      const pickVclip = vi !== -1 && (ii === -1 || selectedVClip !== vi);
+      if (pickVclip) {
+        activeTrack = "vclip";
         vclipMoving = true; vclipMoveIdx = vi; vclipMoveBaseX = e.clientX;
         vclipMoveOrigAt = state.videoTrack[vi].at; vclipMoveHist = false;
         vclipDragFrozenLaneH = trackHeightCss();
         vclipDragOrigTrack = state.videoTrack[vi].track || 0;
-        vclipDragMaxTrack = videoLaneCount(); // permite criar 1 faixa além das existentes
+        vclipDragMaxTrack = vidImgLaneCount();
         selectedVClip = vi; selectedSeg = null; selectedAudio = null; selectedImage = null;
         canvas.style.cursor = "grabbing";
         renderState();
         return;
       }
-      selectedVClip = null; selectedSeg = null; selectedAudio = null; selectedImage = null;
-      scrubbing = true; wasPlaying = isPlaying(); pausePlayback();
-      scrubToVisible(visibleAtEvent(e)); renderState();
-      return;
-    } else if (lane < nVid + nAudio) {
-      activeTrack = "audio";
-      const ai = audioIdxAtVisible(visibleAtEvent(e), lane - nVid);
-      if (ai !== -1) {
-        audioMoving = true; audioMoveIdx = ai; audioMoveBaseX = e.clientX;
-        audioMoveOrigAt = state.audioTrack[ai].at; audioMoveHist = false;
-        audioDragFrozenLaneH = trackHeightCss();
-        audioDragOrigTrack = state.audioTrack[ai].track || 0;
-        audioDragMaxTrack = audioLaneCount();
-        selectedAudio = ai; selectedSeg = null; selectedImage = null; selectedVClip = null;
-        canvas.style.cursor = "grabbing";
-        renderState();
-        return;
-      }
-      selectedAudio = null; selectedSeg = null; selectedImage = null; selectedVClip = null;
-      scrubbing = true; wasPlaying = isPlaying(); pausePlayback();
-      scrubToVisible(visibleAtEvent(e)); renderState();
-      return;
-    } else {
-      activeTrack = "image";
-      const ii = imageIdxAtVisible(visibleAtEvent(e), lane - nVid - nAudio);
       if (ii !== -1) {
+        activeTrack = "image";
         const edge = imageEdgeAt(e, ii);
-        if (edge) {          // perto da borda: aparar (muda a duração) em vez de mover
+        if (edge) {
           imageTrim = { idx: ii, edge, origAt: state.imageTrack[ii].at,
                         origDur: state.imageTrack[ii].duration,
                         baseX: e.clientX, span0: tlSpan(), hist: false };
@@ -2332,13 +2324,31 @@ canvas.addEventListener("pointerdown", (e) => {
         imageMoveOrigAt = state.imageTrack[ii].at; imageMoveHist = false;
         imageDragFrozenLaneH = trackHeightCss();
         imageDragOrigTrack = state.imageTrack[ii].track || 0;
-        imageDragMaxTrack = imageLaneCount();
+        imageDragMaxTrack = vidImgLaneCount();
         selectedImage = ii; selectedSeg = null; selectedAudio = null; selectedVClip = null;
         canvas.style.cursor = "grabbing";
         renderState();
         return;
       }
-      selectedImage = null; selectedSeg = null; selectedAudio = null; selectedVClip = null;
+      selectedVClip = null; selectedSeg = null; selectedAudio = null; selectedImage = null;
+      scrubbing = true; wasPlaying = isPlaying(); pausePlayback();
+      scrubToVisible(visibleAtEvent(e)); renderState();
+      return;
+    } else if (lane < nVidImg + nAudio) {
+      activeTrack = "audio";
+      const ai = audioIdxAtVisible(visibleAtEvent(e), lane - nVidImg);
+      if (ai !== -1) {
+        audioMoving = true; audioMoveIdx = ai; audioMoveBaseX = e.clientX;
+        audioMoveOrigAt = state.audioTrack[ai].at; audioMoveHist = false;
+        audioDragFrozenLaneH = trackHeightCss();
+        audioDragOrigTrack = state.audioTrack[ai].track || 0;
+        audioDragMaxTrack = audioLaneCount();
+        selectedAudio = ai; selectedSeg = null; selectedImage = null; selectedVClip = null;
+        canvas.style.cursor = "grabbing";
+        renderState();
+        return;
+      }
+      selectedAudio = null; selectedSeg = null; selectedImage = null; selectedVClip = null;
       scrubbing = true; wasPlaying = isPlaying(); pausePlayback();
       scrubToVisible(visibleAtEvent(e)); renderState();
       return;
@@ -2379,13 +2389,54 @@ canvas.addEventListener("pointermove", (e) => {
       if (history.past.length > MAX_HISTORY) history.past.shift();
       history.future = []; vclipMoveHist = true;
     }
+    // CONVERSÃO REVERSA: cursor entrou na faixa principal → transforma o vclip num segmento
+    // (espelho do segMoving→vclipMoving existente; dispara ao cruzar o centro da faixa)
+    if (keptSegs().length === 1 && dragMoved) {
+      const cvY = e.clientY - canvas.getBoundingClientRect().top;
+      const laneH = trackHeightCss();
+      if (cvY >= RULER_CSS_H && cvY < mediaAreaTopCss() - laneH / 2) {
+        if (!vclipMoveHist) {
+          history.past.push(JSON.stringify(state));
+          if (history.past.length > MAX_HISTORY) history.past.shift();
+          history.future = [];
+        }
+        const vc = state.videoTrack.splice(vclipMoveIdx, 1)[0];
+        const segIdx = state.segments.findIndex(s => !s.deleted);
+        const seg = state.segments[segIdx];
+        const segAt = animPos.get(segKey(seg)) ?? 0;
+        state.segments[segIdx] = { ...seg, deleted: true };
+        state.videoTrack.push({
+          src: seg.src, start: seg.start, end: seg.end,
+          at: segAt, track: vc.track || 0, speed: seg.speed || 1, hue: seg.hue,
+          x: 0, y: 0, scale: 1, volume: 1, opacity: 1
+        });
+        state.segments.splice(segIdx, 0, {
+          src: vc.src, start: vc.start, end: vc.end,
+          gap: vc.at, deleted: false,
+          speed: vc.speed || 1, volume: vc.volume ?? 1, opacity: vc.opacity ?? 1, hue: vc.hue
+        });
+        vclipMoving = false; vclipDragY = -1; segMoving = true;
+        segMoveIdx = segIdx; segMoveBaseX = e.clientX;
+        segMoveOrigGap = vc.at;
+        segMoveNextIdx = nextKeptIdx(segIdx);
+        segMoveOrigNextGap = segMoveNextIdx !== -1 ? (state.segments[segMoveNextIdx].gap || 0) : 0;
+        segMoveSpan0 = tlSpan(); segMoveHist = true;
+        selectedSeg = segIdx; selectedVClip = null;
+        activeTrack = "video"; downX = e.clientX; downY = e.clientY; dragMoved = true;
+        canvas.style.cursor = "grabbing";
+        drawTimeline();
+        return;
+      }
+    }
     const rect = canvas.getBoundingClientRect();
+    vclipDragY = e.clientY - rect.top;
     const dSec = (e.clientX - vclipMoveBaseX) / rect.width * tlSpan();
     const c = state.videoTrack[vclipMoveIdx];
     // troca de faixa: deslocamento relativo à faixa de origem, estável e sem depender de layout
     if (vclipDragFrozenLaneH > 0) {
-      const dLanes = Math.round((e.clientY - downY) / vclipDragFrozenLaneH);
-      c.track = Math.max(0, Math.min(vclipDragOrigTrack + dLanes, vclipDragMaxTrack));
+      const relY = vclipDragY - mediaAreaTopCss();
+      const targetLane = Math.floor(relY / vclipDragFrozenLaneH);
+      c.track = Math.max(0, Math.min(targetLane, vclipDragMaxTrack));
     }
     clipDragOverExtra = null; // extra lanes não são mais necessárias para vídeo
     c.at = snapVClipAt(Math.max(0, vclipMoveOrigAt + dSec), vclipMoveIdx);
@@ -2401,11 +2452,13 @@ canvas.addEventListener("pointermove", (e) => {
       history.future = []; audioMoveHist = true;
     }
     const rect = canvas.getBoundingClientRect();
+    audioDragY = e.clientY - rect.top;
     const dSec = (e.clientX - audioMoveBaseX) / rect.width * tlSpan();
     const c = state.audioTrack[audioMoveIdx];
     if (audioDragFrozenLaneH > 0) {
-      const dLanes = Math.round((e.clientY - downY) / audioDragFrozenLaneH);
-      c.track = Math.max(0, Math.min(audioDragOrigTrack + dLanes, audioDragMaxTrack));
+      const relY = audioDragY - mediaAreaTopCss();
+      const targetLane = Math.floor(relY / audioDragFrozenLaneH) - vidImgLaneCount();
+      c.track = Math.max(0, Math.min(targetLane, audioDragMaxTrack));
     }
     clipDragOverExtra = null;
     c.at = snapAudioAt(Math.max(0, audioMoveOrigAt + dSec), audioMoveIdx);
@@ -2421,11 +2474,13 @@ canvas.addEventListener("pointermove", (e) => {
       history.future = []; imageMoveHist = true;
     }
     const rect = canvas.getBoundingClientRect();
+    imageDragY = e.clientY - rect.top;
     const dSec = (e.clientX - imageMoveBaseX) / rect.width * tlSpan();
     const c = state.imageTrack[imageMoveIdx];
     if (imageDragFrozenLaneH > 0) {
-      const dLanes = Math.round((e.clientY - downY) / imageDragFrozenLaneH);
-      c.track = Math.max(0, Math.min(imageDragOrigTrack + dLanes, imageDragMaxTrack));
+      const relY = imageDragY - mediaAreaTopCss();
+      const targetLane = Math.floor(relY / imageDragFrozenLaneH);
+      c.track = Math.max(0, Math.min(targetLane, imageDragMaxTrack));
     }
     clipDragOverExtra = null;
     c.at = snapImageAt(Math.max(0, imageMoveOrigAt + dSec), imageMoveIdx);
@@ -2462,18 +2517,20 @@ canvas.addEventListener("pointermove", (e) => {
     if (!onRuler(e) && nearNeedle(e)) { canvas.style.cursor = "ew-resize"; return; }
     if (inMediaLane(e)) {
       const lane = mediaLaneAt(e);
-      const nVid = videoLaneCount();
+      const nVidImg = vidImgLaneCount();
       const nAudio = audioLaneCount();
-      if (lane < nVid) {
+      if (lane < nVidImg) {
+        const vt = visibleAtEvent(e);
+        const vi = vclipIdxAtVisible(vt, lane);
+        const ii = imageIdxAtVisible(vt, lane);
+        canvas.style.cursor = (vi !== -1 || ii !== -1)
+          ? (ii !== -1 && imageEdgeAt(e, ii) ? "col-resize" : "grab")
+          : "crosshair";
+      } else if (lane < nVidImg + nAudio) {
         canvas.style.cursor =
-          vclipIdxAtVisible(visibleAtEvent(e), lane) !== -1 ? "grab" : "crosshair";
-      } else if (lane < nVid + nAudio) {
-        canvas.style.cursor =
-          audioIdxAtVisible(visibleAtEvent(e), lane - nVid) !== -1 ? "grab" : "crosshair";
+          audioIdxAtVisible(visibleAtEvent(e), lane - nVidImg) !== -1 ? "grab" : "crosshair";
       } else {
-        const ii = imageIdxAtVisible(visibleAtEvent(e), lane - nVid - nAudio);
-        canvas.style.cursor = ii === -1 ? "crosshair"
-          : imageEdgeAt(e, ii) ? "col-resize" : "grab";
+        canvas.style.cursor = "crosshair";
       }
       return;
     }
@@ -2514,14 +2571,14 @@ canvas.addEventListener("pointermove", (e) => {
       const initTrack = Math.max(0, Math.floor(relY / frozenH));
       state.videoTrack[newIdx].track = initTrack;
       segMoving = false;
-      vclipMoving = true;
+      vclipMoving = true; vclipDragY = e.clientY - canvas.getBoundingClientRect().top;
       vclipMoveIdx = newIdx;
       vclipMoveBaseX = e.clientX;
       vclipMoveOrigAt = at;
       vclipMoveHist = true;
       vclipDragFrozenLaneH = frozenH;
       vclipDragOrigTrack = initTrack;
-      vclipDragMaxTrack = videoLaneCount();
+      vclipDragMaxTrack = vidImgLaneCount();
       downX = e.clientX; downY = e.clientY;
       dragMoved = true;
       selectedSeg = null; selectedVClip = newIdx;
@@ -2591,7 +2648,7 @@ canvas.addEventListener("pointermove", (e) => {
 });
 canvas.addEventListener("pointerup", (e) => {
   if (vclipMoving) {
-    vclipMoving = false;
+    vclipMoving = false; vclipDragY = -1;
     if (clipDragOverExtra != null) {
       dropClipOnExtra(state.videoTrack, vclipMoveIdx);
       clipDragOverExtra = null;
@@ -2601,7 +2658,7 @@ canvas.addEventListener("pointerup", (e) => {
     return;
   }
   if (audioMoving) {
-    audioMoving = false;
+    audioMoving = false; audioDragY = -1;
     if (clipDragOverExtra != null) {
       dropClipOnExtra(state.audioTrack, audioMoveIdx);
       clipDragOverExtra = null;
@@ -2611,7 +2668,7 @@ canvas.addEventListener("pointerup", (e) => {
     return;
   }
   if (imageMoving) {
-    imageMoving = false;
+    imageMoving = false; imageDragY = -1;
     if (clipDragOverExtra != null) {
       dropClipOnExtra(state.imageTrack, imageMoveIdx);
       clipDragOverExtra = null;
@@ -2667,27 +2724,24 @@ function computeDragOverLane(clientY) {
   const y = clientY - rect.top;
   if (y < RULER_CSS_H) return null;
   const thCss = trackHeightCss();
-  const nVid = videoLaneCount();
+  const nVidImg = vidImgLaneCount();
   const nAudio = audioLaneCount();
-  const nImage = imageLaneCount();
   const nExtra = state.extraLanes || 0;
   let lane = null;
   if (nExtra > 0 && y >= extraAreaTopCss())
     lane = { type: "extra", idx: Math.max(0, Math.min(nExtra - 1, Math.floor((y - extraAreaTopCss()) / thCss))) };
   else if (mediaLaneTotal() > 0 && y >= mediaAreaTopCss()) {
     const li = Math.max(0, Math.min(mediaLaneTotal() - 1, Math.floor((y - mediaAreaTopCss()) / thCss)));
-    lane = li < nVid ? { type: "vlane", idx: li }
-      : li < nVid + nAudio ? { type: "audio", idx: li - nVid }
-      : { type: "image", idx: li - nVid - nAudio };
+    lane = li < nVidImg ? { type: "vidimg", idx: li }
+      : { type: "audio", idx: li - nVidImg };
   } else lane = { type: "video", idx: 0 };
   // compatibilidade: extra aceita tudo; timeline vazia aceita qualquer mídia;
-  // as demais faixas só o próprio tipo
+  // seção "vidimg" aceita vídeo E imagem; áudio só vai para áudio
   const ok = lane.type === "extra"
     || trackCount() === 0
     || (dragKind === "audio" && lane.type === "audio")
-    || (dragKind === "image" && lane.type === "image")
-    || ((dragKind === "video" || dragKind === "project" || !dragKind)
-        && (lane.type === "video" || lane.type === "vlane"));
+    || ((dragKind === "image" || dragKind === "video" || dragKind === "project" || !dragKind)
+        && (lane.type === "video" || lane.type === "vidimg"));
   return ok ? lane : null;
 }
 
@@ -2725,13 +2779,13 @@ dropZone.addEventListener("drop", (e) => {
     return addAudioClip(path, at, targetLane);
   }
   if (kind === "image") {
-    const targetLane = overLane?.type === "image" ? overLane.idx : undefined;
+    const targetLane = overLane?.type === "vidimg" ? overLane.idx : undefined;
     return addImageClip(path, at, targetLane);
   }
-  // vídeo: destino totalmente livre — lane de vídeo existente, faixa extra
+  // vídeo: destino totalmente livre — lane combinada existente, faixa extra
   // (vira lane nova) ou a faixa principal (comportamento clássico de append)
-  if (overLane?.type === "vlane") return addVideoClip(path, at, overLane.idx);
-  if (overLane?.type === "extra") return addVideoClip(path, at, videoLaneCount());
+  if (overLane?.type === "vidimg") return addVideoClip(path, at, overLane.idx);
+  if (overLane?.type === "extra") return addVideoClip(path, at, vidImgLaneCount());
   addToTimeline(path);
 });
 
@@ -3026,6 +3080,11 @@ $("seg-speed").onchange = () => {
     apply(s => { s.audioTrack[i].speed = parseFloat($("seg-speed").value); });
     return;
   }
+  if (selectedVClip != null) {
+    const i = selectedVClip;
+    apply(s => { s.videoTrack[i].speed = parseFloat($("seg-speed").value); });
+    return;
+  }
   setSpeedSelected();
 };
 $("seg-vol").oninput = () => {
@@ -3042,6 +3101,11 @@ $("seg-vol").onchange = () => {
   if (selectedAudio != null) {
     const i = selectedAudio;
     apply(s => { s.audioTrack[i].volume = v; });
+    return;
+  }
+  if (selectedVClip != null) {
+    const i = selectedVClip;
+    apply(s => { s.videoTrack[i].volume = v; });
     return;
   }
   withSelected(i => apply(s => { s.segments[i].volume = v; }));
@@ -3073,29 +3137,26 @@ $("seg-op").onchange = () => {
   withSelected(i => apply(s => { s.segments[i].opacity = v; }));
 };
 $("img-scale").oninput = () => {
-  if (selectedImage == null) return;
   const sc = parseInt($("img-scale").value, 10) / 100;
   $("img-scale-val").textContent = $("img-scale").value + "%";
-  const inner = $("image-overlay")
-    .querySelector(`.img-wrap[data-idx="${selectedImage}"] .img-inner`);
-  if (inner) applyImgTransform(inner, { ...state.imageTrack[selectedImage], scale: sc });
+  if (selectedImage != null) {
+    const inner = $("image-overlay")
+      .querySelector(`.img-wrap[data-idx="${selectedImage}"] .img-inner`);
+    if (inner) applyImgTransform(inner, { ...state.imageTrack[selectedImage], scale: sc });
+  } else if (selectedVClip != null) {
+    const inner = document.querySelector(`.vlane-inner[data-ci="${selectedVClip}"]`);
+    if (inner) applyVlaneTransform(inner, { ...state.videoTrack[selectedVClip], scale: sc });
+  }
 };
 $("img-scale").onchange = () => {
-  if (selectedImage == null) return;
-  const i = selectedImage, sc = parseInt($("img-scale").value, 10) / 100;
-  apply(s => { s.imageTrack[i].scale = sc; });
-};
-$("vclip-scale").oninput = () => {
-  if (selectedVClip == null) return;
-  const sc = parseInt($("vclip-scale").value, 10) / 100;
-  $("vclip-scale-val").textContent = $("vclip-scale").value + "%";
-  const inner = document.querySelector(`.vlane-inner[data-ci="${selectedVClip}"]`);
-  if (inner) applyVlaneTransform(inner, { ...state.videoTrack[selectedVClip], scale: sc });
-};
-$("vclip-scale").onchange = () => {
-  if (selectedVClip == null) return;
-  const i = selectedVClip, sc = parseInt($("vclip-scale").value, 10) / 100;
-  apply(s => { s.videoTrack[i].scale = sc; });
+  const sc = parseInt($("img-scale").value, 10) / 100;
+  if (selectedImage != null) {
+    const i = selectedImage;
+    apply(s => { s.imageTrack[i].scale = sc; });
+  } else if (selectedVClip != null) {
+    const i = selectedVClip;
+    apply(s => { s.videoTrack[i].scale = sc; });
+  }
 };
 $("img-rot").oninput = () => {
   if (selectedImage == null) return;
@@ -3576,8 +3637,8 @@ function renderState() {
     const vop = Math.round((vclipSel.opacity ?? 1) * 100);
     $("seg-op").value = vop; $("seg-op-val").textContent = vop + "%";
     const vsc = Math.round((vclipSel.scale ?? 1) * 100);
-    $("vclip-scale").value = String(Math.min(200, Math.max(10, vsc)));
-    $("vclip-scale-val").textContent = vsc + "%";
+    $("img-scale").value = String(Math.min(300, Math.max(10, vsc)));
+    $("img-scale-val").textContent = vsc + "%";
     $("btn-reset-adjust").disabled = false;
   } else if (audioSel) {
     const inf = sources.get(audioSel.src)?.info;
@@ -3651,7 +3712,7 @@ function startPolling() {
 }
 
 const OP_LABEL = {
-  cut: "Corte", convert: "Conversão",
+  cut: "Corte", join: "Junção", convert: "Conversão",
   extract: "Áudio", delete: "Remoção", render: "Exportação", render_convert: "Exportação",
   render_multi: "Exportação", mix_audio: "Exportação", overlay_images: "Exportação",
   preview: "Pré-visualização",
