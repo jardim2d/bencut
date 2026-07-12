@@ -416,7 +416,7 @@ body.image-sel .scale-ctrl, body.vclip-sel .scale-ctrl { display: flex; }
 .vlane-inner.active-sel { pointer-events: auto; cursor: grab; }
 .vlane-inner.active-sel:active { cursor: grabbing; }
 .vlane-inner video {
-  width: 100%; height: 100%; object-fit: cover;
+  width: 100%; height: 100%; object-fit: contain;
   display: block; pointer-events: none; background: #000;
 }
 /* moldura de seleção: segue a área visível (inset em % vem do JS = crop) */

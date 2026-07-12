@@ -1036,10 +1036,125 @@ def op_overlay_images(p):
     return start_job("overlay_images", cmd, dur, out, cleanup=[base] if base else None)
 
 
+def op_overlay_vclips(p):
+    """Passada extra: grava VCLIPS sobre um vídeo já renderizado como overlays (PiP).
+
+    input         = vídeo-base (apagado ao fim); sem input, gera base preta
+    vclips        = [[src, ss, se, at, speed, vol, x, y, scale, opacity, track,
+                       cropL, cropR, cropT, cropB], ...]
+    base_duration = duração da base preta (quando não há input)
+    """
+    base = safe_path(p["input"]) if p.get("input") else None
+    out = safe_path(p["output"])
+    fmt = p.get("format") or os.path.splitext(out)[1].lstrip(".") or "mp4"
+
+    def _vc(x):
+        return (safe_path(x[0]), float(x[1]), float(x[2]), float(x[3]),
+                float(x[4]) if len(x) > 4 else 1.0,   # speed
+                float(x[5]) if len(x) > 5 else 1.0,   # vol (reservado)
+                float(x[6]) if len(x) > 6 else 0.0,   # x offset (fração)
+                float(x[7]) if len(x) > 7 else 0.0,   # y offset
+                float(x[8]) if len(x) > 8 else 1.0,   # scale
+                float(x[9]) if len(x) > 9 else 1.0,   # opacity
+                int(x[10]) if len(x) > 10 else 0,      # track (z-order)
+                float(x[11]) if len(x) > 11 else 0.0,  # cropL
+                float(x[12]) if len(x) > 12 else 0.0,  # cropR
+                float(x[13]) if len(x) > 13 else 0.0,  # cropT
+                float(x[14]) if len(x) > 14 else 0.0)  # cropB
+
+    # ordena por track ascendente: faixas de fundo são compostas primeiro
+    vclips = [_vc(x) for x in sorted(p["vclips"], key=lambda x: int(x[10]) if len(x) > 10 else 0)]
+    if not vclips:
+        raise ValueError("nenhum vclip para gravar")
+
+    cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]
+    if base:
+        info = probe(base)
+        dur = info["duration"]
+        v = info["video"] or {}
+        W, H = int(v.get("width") or 1920), int(v.get("height") or 1080)
+        has_audio = bool(info["audio"])
+        cmd += ["-i", base]
+    else:
+        dur = float(p.get("base_duration") or 0)
+        W, H, has_audio = 1920, 1080, False
+        cmd += ["-f", "lavfi", "-t", f"{dur:.3f}", "-i", f"color=c=black:s={W}x{H}:r=30"]
+
+    for src, ss, se, *_ in vclips:
+        cmd += ["-ss", f"{ss:.6f}", "-to", f"{se:.6f}", "-i", src]
+
+    filters, prev = [], "[0:v]"
+    for k, (src, ss, se, at, speed, vol, x, y, scale, op, track,
+            cropL, cropR, cropT, cropB) in enumerate(vclips, start=1):
+        sw = round(W * scale)
+        sh = round(H * scale)
+        need_crop = cropL > 1e-6 or cropR > 1e-6 or cropT > 1e-6 or cropB > 1e-6
+        need_alpha = abs(op - 1.0) > 1e-6
+
+        # normaliza PTS (seek de input pode não zerar), aplica speed e desloca para `at`
+        filters.append(f"[{k}:v]setpts=(PTS-STARTPTS)/{speed:.6f}+{at:.6f}/TB[vspd{k}]")
+
+        # object-fit: contain — escala para caber em sw×sh, centra, preenche com preto.
+        # Dimensões pré-calculadas via probe para evitar erros de reinicialização de filtro.
+        vi = (probe(src).get("video") or {})
+        vw = int(vi.get("width") or sw)
+        vh = int(vi.get("height") or sh)
+        fac = min(sw / max(vw, 1), sh / max(vh, 1))
+        iw = max(1, round(vw * fac))
+        ih = max(1, round(vh * fac))
+        # garante dimensões pares (exigido pelo libvpx-vp9 / libx264)
+        iw -= iw % 2
+        ih -= ih % 2
+        px = (sw - iw) // 2
+        py = (sh - ih) // 2
+        filters.append(f"[vspd{k}]scale={iw}:{ih},setsar=1,pad={sw}:{sh}:{px}:{py}:black[vsc{k}]")
+        cur = f"[vsc{k}]"
+
+        # crop: extrai a janela visível sem redimensionar o conteúdo
+        # as frações cropL/R/T/B são relativas ao elemento (= ao tamanho escalado)
+        if need_crop:
+            cw = max(1, round(sw * (1 - cropL - cropR)))
+            ch = max(1, round(sh * (1 - cropT - cropB)))
+            cx = round(sw * cropL)
+            cy = round(sh * cropT)
+            filters.append(f"{cur}crop={cw}:{ch}:{cx}:{cy}[vcrop{k}]")
+            cur = f"[vcrop{k}]"
+
+        # opacidade (requer canal alfa)
+        if need_alpha:
+            filters.append(f"{cur}format=rgba[vfmt{k}]")
+            filters.append(f"[vfmt{k}]colorchannelmixer=aa={op:.4f}[vpre{k}]")
+            cur = f"[vpre{k}]"
+
+        # posição do overlay: centro + deslocamento do usuário + compensação do crop
+        # fórmula: W*((1-scale)/2 + x + scale*cropL) — o crop da esquerda empurra
+        # o overlay para a direita na mesma proporção que o conteúdo foi deslocado
+        ox = W * ((1 - scale) / 2 + x + scale * cropL)
+        oy = H * ((1 - scale) / 2 + y + scale * cropT)
+        filters.append(f"{prev}{cur}overlay={ox:.2f}:{oy:.2f}:eof_action=pass[vo{k}]")
+        prev = f"[vo{k}]"
+
+    filters.append(f"{prev}format=yuv420p[vout]")
+    graph = ";".join(filters)
+
+    if fmt == "webm":
+        venc = ["-c:v", "libvpx-vp9", "-crf", "31", "-b:v", "0",
+                "-row-mt", "1", "-cpu-used", "2"]
+    elif NVENC:
+        venc = ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "23", "-b:v", "0"]
+    else:
+        venc = ["-c:v", "libx264", "-preset", "medium", "-crf", "23"]
+    amap = ["-map", "0:a", "-c:a", "copy"] if has_audio else ["-an"]
+    tail = ["-movflags", "+faststart"] if fmt == "mp4" else []
+    cmd += ["-filter_complex", graph, "-map", "[vout]"] + amap + venc + tail + [out]
+    return start_job("overlay_vclips", cmd, dur, out, cleanup=[base] if base else None)
+
+
 OPS = {"cut": op_cut, "join": op_join, "convert": op_convert,
        "extract": op_extract_audio, "delete": op_delete, "render": op_render,
        "render_convert": op_render_convert, "render_multi": op_render_multi,
-       "mix_audio": op_mix_audio, "overlay_images": op_overlay_images}
+       "mix_audio": op_mix_audio, "overlay_images": op_overlay_images,
+       "overlay_vclips": op_overlay_vclips}
 
 
 # ---------- HTTP ----------

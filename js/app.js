@@ -1241,6 +1241,7 @@ function syncImageOverlay(vt) {
     const inner = wrap.querySelector(".img-inner");
     const img = wrap.querySelector("img");
 
+    wrap.style.zIndex = String((c.track || 0) + 1);  // faixas superiores ficam à frente
     // limitar tamanho natural ao frame (CSS var atualizado acima)
     img.style.maxWidth = ovW + "px";
     img.style.maxHeight = ovH + "px";
@@ -1411,10 +1412,11 @@ document.addEventListener("pointerdown", e => {
                   startDist: Math.max(1, Math.hypot(e.clientX - cx, e.clientY - cy)),
                   live: c.scale ?? 1 };
   } else {
+    const { w: cw, h: ch } = vlaneContentArea();
     vlaneDrag = { type: "move", ci,
                   startX: e.clientX, startY: e.clientY,
                   startImgX: c.x ?? 0, startImgY: c.y ?? 0,
-                  pwW: pwRect.width, pwH: pwRect.height,
+                  pwW: cw, pwH: ch,
                   liveX: c.x ?? 0, liveY: c.y ?? 0 };
   }
   inner.setPointerCapture(e.pointerId);
@@ -1597,10 +1599,20 @@ function vlaneEl(lane) {
   return vlaneEls[lane];
 }
 
-function applyVlaneTransform(inner, c) {
+// Retorna as dimensões da área útil do vídeo no player (sem as barras pretas do letterbox).
+// É proporcional ao vídeo base e serve como espaço de coordenadas compartilhado com o export.
+function vlaneContentArea() {
   const pw = $("player-wrap");
-  const tx = (c.x ?? 0) * pw.clientWidth;
-  const ty = (c.y ?? 0) * pw.clientHeight;
+  const vW = player.videoWidth || pw.clientWidth;
+  const vH = player.videoHeight || pw.clientHeight;
+  const ratio = Math.min(pw.clientWidth / vW, pw.clientHeight / vH);
+  return { w: vW * ratio, h: vH * ratio };
+}
+
+function applyVlaneTransform(inner, c) {
+  const { w: cw, h: ch } = vlaneContentArea();
+  const tx = (c.x ?? 0) * cw;
+  const ty = (c.y ?? 0) * ch;
   inner.style.transform = `translate(${tx}px,${ty}px) scale(${c.scale ?? 1})`;
   const l = (c.cropL ?? 0) * 100, r = (c.cropR ?? 0) * 100,
         t = (c.cropT ?? 0) * 100, b = (c.cropB ?? 0) * 100;
@@ -1633,19 +1645,27 @@ function syncVideoLanes(playVis, mainCovers) {
     const wrap = vlaneEl(lane);
     const inner = wrap.querySelector(".vlane-inner");
     const v = inner.querySelector("video");
+    // clipe no playhead (para reprodução)
     const ci = playVis == null ? -1 : vclipIdxAtVisible(playVis, lane);
-    const c = ci === -1 ? null : state.videoTrack[ci];
-    wrap.classList.toggle("show", !!c && !mainCovers);
-    wrap.style.zIndex = nVid - lane;  // lane 0 fica acima
+    // clipe selecionado nesta lane (para edição no tocador)
+    const selClip = selectedVClip != null ? state.videoTrack[selectedVClip] : null;
+    const selInLane = selClip && (selClip.track || 0) === lane ? selectedVClip : -1;
+    // usa o do playhead; na ausência, usa o selecionado (edição sem reprodução)
+    const effectiveCi = ci !== -1 ? ci : selInLane;
+    const c = effectiveCi === -1 ? null : state.videoTrack[effectiveCi];
+    wrap.classList.toggle("show", !!c && (ci !== -1 || selInLane !== -1));
+    wrap.style.zIndex = lane + 1;  // faixas superiores ficam à frente
     if (!c) { if (!v.paused) v.pause(); continue; }
-    inner.dataset.ci = String(ci);
+    inner.dataset.ci = String(effectiveCi);
     const src = sources.get(c.src);
     const url = (src && src.media) || ("/api/media?path=" + encodeURIComponent(c.src));
     if (v.dataset.src !== c.src) { v.src = url; v.dataset.src = c.src; }
     v.volume = c.volume ?? 1;
     v.playbackRate = c.speed || 1;
-    const want = c.start + (playVis - c.at) * (c.speed || 1);
-    if (playing) {
+    // quando o playhead está dentro do clipe: usa a posição exata; caso contrário: mostra início
+    const clampedVis = Math.max(c.at, Math.min(c.at + videoVis(c) - 1e-6, playVis));
+    const want = c.start + (clampedVis - c.at) * (c.speed || 1);
+    if (playing && ci !== -1) {
       if (v.paused) v.play().catch(() => {});
       if (Math.abs(v.currentTime - want) > 0.3) { try { v.currentTime = want; } catch {} }
     } else {
@@ -1653,7 +1673,7 @@ function syncVideoLanes(playVis, mainCovers) {
       if (Math.abs(v.currentTime - want) > 0.05) { try { v.currentTime = want; } catch {} }
     }
     // handles: só para o clipe selecionado
-    const sel = ci === selectedVClip;
+    const sel = effectiveCi === selectedVClip;
     inner.classList.toggle("active-sel", sel);
     for (const h of [...inner.querySelectorAll(".vlane-h, .vlane-c, .vlane-box")]) h.remove();
     if (sel) {
@@ -2798,8 +2818,17 @@ function advancePlayback() {
   const del = state.segments.find(s => s.deleted && s.src === activeSrc && t >= s.start && t < s.end);
   if (del) {
     const nxt = nextKeptAfter(del);
-    if (nxt) goToKept(nxt);
-    else { player.pause(); player.currentTime = del.start; }
+    if (nxt) { goToKept(nxt); return; }
+    // não há próximo segmento: se áudio/imagem/vclip se estende além, entra no "tail"
+    player.pause();
+    if (timelineDur() > animDur + 1e-6) {
+      inTail = true; setGapOverlay(true);
+      noVidT = animDur; noVidPlaying = true;
+      noVidAnchorMs = performance.now(); noVidAnchorT = noVidT;
+      requestAnimationFrame(noVidTick);
+    } else {
+      player.currentTime = del.start;
+    }
     return;
   }
   // 2) dentro de um trecho mantido do arquivo ativo
@@ -3429,12 +3458,9 @@ $("btn-export-go").onclick = async () => {
     finally { btn.disabled = false; }
     return;
   }
-  // com lanes de vídeo livre: resolve a prioridade numa sequência única
-  const rparts = vclips.length ? resolveVideoParts() : null;
-  const srcs = rparts ? [...new Set(rparts.map(p => p[0]))]
-                      : [...new Set(kept.map(s => s.src))];
-  const multi = srcs.length > 1 || !!rparts;
-  const refFile = kept[0]?.src || vclips[0].src;
+  const srcs = [...new Set(kept.map(s => s.src))];
+  const multi = srcs.length > 1;
+  const refFile = kept[0]?.src || vclips[0]?.src;
   const format = $("export-format").value; // "" = manter original, ou "mp4"/"webm"
   // textos gravados no vídeo exigem recodificar tudo (drawtext não sai em -c copy)
   const burnTexts = state.texts.length > 0;
@@ -3443,47 +3469,53 @@ $("btn-export-go").onclick = async () => {
   // multi-arquivo sempre recodifica/normaliza (formatos podem diferir) → mp4 por padrão
   const ext = multi ? (format || "mp4")
     : (burnTexts ? burnFormat : (format || origExt));
-  // fade preto nas emendas: metade na saída de um trecho, metade na entrada do outro
   const fd = state.transition || 0;
-  const nParts = rparts ? rparts.length : kept.length;
   const fades = (i) => [i > 0 && fd ? fd / 2 : 0,
-                        i < nParts - 1 && fd ? fd / 2 : 0];
+                        i < kept.length - 1 && fd ? fd / 2 : 0];
   const btn = $("btn-export-go");
   btn.disabled = true;
   try {
     const picked = await api("/api/pick-save?input=" + encodeURIComponent(refFile) +
       "&suffix=editado&ext=" + encodeURIComponent(ext));
     if (picked.cancelled) return; // usuário cancelou no seletor, painel continua aberto
-    let body;
-    if (multi) {
-      body = {
-        op: "render_multi", output: picked.path, format: format || "mp4",
-        parts: rparts
-          ? rparts.map((p, i) => [...p, ...fades(i)])
-          : kept.map((s, i) => [s.src, s.start, s.end, s.speed || 1, s.gap || 0,
-                                s.volume ?? 1, s.opacity ?? 1, ...fades(i)]),
-      };
-    } else {
-      const conv = format || burnTexts;   // drawtext exige o caminho que recodifica
-      body = {
-        op: conv ? "render_convert" : "render",
-        input: kept[0].src, output: picked.path,
-        parts: kept.map((s, i) => [s.start, s.end, s.speed || 1, s.gap || 0,
-                                   s.volume ?? 1, s.opacity ?? 1, ...fades(i)]),
-      };
-      if (conv) body.format = burnFormat;
+    let body = null;
+    if (kept.length) {
+      if (multi) {
+        body = {
+          op: "render_multi", output: picked.path, format: format || "mp4",
+          parts: kept.map((s, i) => [s.src, s.start, s.end, s.speed || 1, s.gap || 0,
+                                     s.volume ?? 1, s.opacity ?? 1, ...fades(i)]),
+        };
+      } else {
+        const conv = format || burnTexts;   // drawtext exige o caminho que recodifica
+        body = {
+          op: conv ? "render_convert" : "render",
+          input: kept[0].src, output: picked.path,
+          parts: kept.map((s, i) => [s.start, s.end, s.speed || 1, s.gap || 0,
+                                     s.volume ?? 1, s.opacity ?? 1, ...fades(i)]),
+        };
+        if (conv) body.format = burnFormat;
+      }
+      if (burnTexts) body.texts = state.texts;
     }
-    if (burnTexts) body.texts = state.texts;
 
-    // passadas extras encadeadas sobre o vídeo-base: primeiro as imagens
-    // (overlay recodifica o vídeo e copia o áudio), depois a trilha de áudio
-    // (mix copia o vídeo e só recodifica o áudio) — cada uma barata e isolada
-    const outFmt = body.format || ext;
+    const outFmt = (body?.format) || ext;
+    // vclips são gravados como overlay sobre o vídeo-base (picture-in-picture)
+    const vclipData = vclips.map(c => [
+      c.src, c.start, c.end, c.at, c.speed || 1, c.volume ?? 1,
+      c.x ?? 0, c.y ?? 0, c.scale ?? 1, c.opacity ?? 1, c.track || 0,
+      c.cropL ?? 0, c.cropR ?? 0, c.cropT ?? 0, c.cropB ?? 0
+    ]);
     const passes = [];
+    if (vclipData.length)
+      passes.push({ op: "overlay_vclips", format: outFmt, vclips: vclipData });
     if (images.length)
       passes.push({ op: "overlay_images", format: outFmt, images });
     if (audios.length)
       passes.push({ op: "mix_audio", format: outFmt, tracks: audios });
+    // sem segmentos principais: primeiro passo cria base preta com os vclips
+    if (!body && passes.length)
+      body = { ...passes.shift(), base_duration: timelineDur() };
     if (passes.length) {
       const noExt = picked.path.replace(/(\.[^.]+)$/, "");
       setExportOptsVisible(false);
