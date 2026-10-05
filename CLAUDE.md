@@ -1,6 +1,6 @@
 # CLAUDE.md — BenCut
 
-Editor de vídeo web local. Stack: Python (Flask, server.py) + JavaScript (app.js) + FFmpeg. Roda em `localhost:8765`.
+Editor de vídeo web local. Stack: Python (biblioteca padrão, server.py) + JavaScript (app.js) + FFmpeg. Roda em `localhost:8765`.
 
 **Tradeoff:** Estas diretrizes priorizam cautela sobre velocidade. Para tarefas triviais, use o bom senso.
 
@@ -8,12 +8,12 @@ Editor de vídeo web local. Stack: Python (Flask, server.py) + JavaScript (app.j
 
 ## Arquitetura
 
-- `server.py` — backend Flask, constrói e executa comandos FFmpeg, expõe API REST
+- `server.py` — backend HTTP com `ThreadingHTTPServer`, constrói e executa comandos FFmpeg, expõe API REST
 - `js/app.js` — frontend completo: estado da timeline, UI, player, comunicação com server
 - `css/style.css` — estilos globais
 - `run.sh` — inicialização
 
-**Estado da timeline** (em `app.js`): `state.segments`, `state.audioTrack`, `state.videoTrack`, `state.imageTrack`, `state.texts`. Toda mutação de estado passa pela função `apply(mutator)` para garantir undo/redo. Nunca mute `state` diretamente fora de `apply()`.
+**Estado da timeline** (em `app.js`): `state.segments`, `state.audioTrack`, `state.videoTrack`, `state.imageTrack`, `state.texts`. Edições discretas passam por `apply(mutator)` para garantir undo/redo. Os arrastes existentes registram um snapshot no início do gesto e atualizam o estado durante o movimento; `resetEditor()` limpa estado e histórico.
 
 ---
 
@@ -70,6 +70,6 @@ Para tarefas multi-passo, liste o plano antes de executar.
 
 - Backend (`server.py`): comentários e strings em PT; construção de comandos FFmpeg como listas Python
 - Frontend (`app.js`): comentários em PT, nomes de variáveis em inglês
-- Toda mutação de `state` via `apply(mutator)` — nunca diretamente
+- Use `apply(mutator)` nas edições discretas; preserve o histórico por gesto nos arrastes existentes e a limpeza explícita em `resetEditor()`
 - Projetos salvos: formato `.evp` (JSON); mudanças em `state` impactam compatibilidade de arquivos existentes
-- NVENC: sempre cheque disponibilidade antes de usar — o server já tem lógica para fallback software
+- NVENC: a inicialização testa uma codificação real; falhas de codificação NVENC permitem uma nova tentativa por software

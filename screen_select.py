@@ -8,6 +8,8 @@ Uso: screen_select.py [PROPORÇÃO]   ex: 16:9
 Saída: "x,y WxH"
 """
 import os
+from desktop_session import refresh_display_environment
+refresh_display_environment()
 os.environ['GDK_BACKEND'] = 'x11'
 
 import sys
@@ -64,8 +66,14 @@ if raw_aspect:
     aspect = wa / ha
 
 AREA_KEY = raw_aspect or 'livre'
+fixed_size = len(sys.argv) > 2 and sys.argv[2] == '540x960'
+if fixed_size:
+    AREA_KEY = '9:16-540x960'
 
 display = Gdk.Display.get_default()
+if display is None:
+    print('Não foi possível acessar a sessão gráfica. Pare o BenCut e inicie python3 server.py em um Terminal desta sessão do Ubuntu.', file=sys.stderr)
+    sys.exit(1)
 monitor = display.get_primary_monitor() or display.get_monitor(0)
 geo     = monitor.get_geometry()
 SW, SH  = geo.width, geo.height
@@ -89,8 +97,18 @@ else:
     SAVED_X = (SW - RW) // 2
     SAVED_Y = (SH - RH) // 2
 
+if fixed_size:
+    RW, RH = 540, 960
+    if RW > SW or RH > SH:
+        print('O recorte 540 × 960 não cabe neste monitor. Escolha Personalizado.', file=sys.stderr)
+        sys.exit(1)
+    SAVED_X = max(geo.x, min(SAVED_X if saved else geo.x + (SW - RW) // 2, geo.x + SW - RW))
+    SAVED_Y = max(geo.y, min(SAVED_Y if saved else geo.y + (SH - RH) // 2, geo.y + SH - RH))
+
 
 def get_edge(x, y, w, h):
+    if fixed_size:
+        return None
     left   = x < HANDLE
     right  = x > w - HANDLE
     top    = y < HANDLE
@@ -110,7 +128,7 @@ class PositionFrame(Gtk.Window):
     def __init__(self):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.set_decorated(False)
-        self.set_resizable(True)
+        self.set_resizable(not fixed_size)
         self.set_default_size(RW, RH)
         self.set_keep_above(True)
         self.set_app_paintable(True)

@@ -13,15 +13,19 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import urllib.parse
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
+from record_crop import crop_filter
 
 PORT = 8765
 ROOT = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
 START_DIR = os.path.join(HOME, "Vídeos") if os.path.isdir(os.path.join(HOME, "Vídeos")) else HOME
+# A pasta de vídeos pode estar em outro disco, ligada ao home por symlink.
+ALLOWED_ROOTS = tuple(dict.fromkeys(map(os.path.realpath, (HOME, START_DIR))))
 
 VIDEO_EXTS = {".mp4", ".mkv", ".m4v", ".mov", ".avi", ".webm", ".ts", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp"}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav", ".wma"}
@@ -57,38 +61,96 @@ procs = {}   # job_id -> Popen do ffmpeg em execução (para cancelamento)
 
 record_state = {'active': False, 'file': None, 'proc': None, 'overlay': None}
 record_lock = threading.Lock()
+record_stop_lock = threading.Lock()
 
 
 def has_nvenc():
+    """Confirma que a GPU consegue codificar, não apenas que o encoder existe."""
     try:
-        out = subprocess.run([FFMPEG, "-hide_banner", "-encoders"],
-                             capture_output=True, text=True, timeout=10).stdout
-        return "h264_nvenc" in out
-    except Exception:
+        result = subprocess.run(
+            [FFMPEG, "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+             "color=s=128x128:r=1", "-frames:v", "1", "-c:v", "h264_nvenc",
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=10)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+def cpu_fallback_cmd(cmd):
+    """Mantém entradas/filtros e troca somente as opções do encoder NVENC."""
+    if "-c:v" not in cmd:
+        return None
+    encoder = cmd[cmd.index("-c:v") + 1]
+    software = {"h264_nvenc": "libx264", "hevc_nvenc": "libx265"}.get(encoder)
+    if software is None:
+        return None
+    result = []
+    i = 0
+    while i < len(cmd):
+        arg = cmd[i]
+        if arg in ("-rc", "-forced-idr", "-b:v"):
+            i += 2
+            continue
+        if arg in ("-c:v", "-preset", "-cq"):
+            value = cmd[i + 1]
+            result += (["-c:v", software] if arg == "-c:v" else
+                       ["-preset", "medium"] if arg == "-preset" else ["-crf", value])
+            i += 2
+            continue
+        result.append(arg)
+        i += 1
+    return result
+
+
+def run_encode(cmd, timeout):
+    """Uma falha NVENC permite uma única nova tentativa por software."""
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    fallback = cpu_fallback_cmd(cmd) if result.returncode != 0 else None
+    if fallback:
+        result = subprocess.run(fallback, capture_output=True, text=True, timeout=timeout)
+    return result
 
 
 NVENC = None  # preenchido no main
 
 
 def safe_path(path):
-    """Restringe acesso a arquivos dentro do home do usuário."""
+    """Permite o home e o destino da pasta Vídeos; resolve links antes de validar."""
     real = os.path.realpath(path)
-    if not real.startswith(HOME + os.sep) and real != HOME:
-        raise PermissionError(f"acesso negado fora do home: {real}")
+    if not any(os.path.commonpath((root, real)) == root for root in ALLOWED_ROOTS):
+        raise PermissionError(f"acesso negado fora das pastas permitidas: {real}")
     return real
 
 
 def trash_file(path):
-    """Move o arquivo para a lixeira (reversível) via gio; se o gio não estiver
-    disponível, remove definitivamente."""
+    """Move para a lixeira, inclusive entre montagens diferentes do sandbox."""
     gio = shutil.which("gio")
     if gio:
         r = subprocess.run([gio, "trash", "--", path],
                            capture_output=True, text=True, timeout=30)
         if r.returncode == 0:
             return
-    os.remove(path)
+    # O gio pode recusar a lixeira do disco em montagens isoladas. Nesse caso,
+    # usa a lixeira pessoal e copia entre discos, sem apagar definitivamente.
+    trash = os.path.join(os.environ.get("XDG_DATA_HOME") or
+                         os.path.join(HOME, ".local", "share"), "Trash")
+    files = os.path.join(trash, "files")
+    info = os.path.join(trash, "info")
+    os.makedirs(files, mode=0o700, exist_ok=True)
+    os.makedirs(info, mode=0o700, exist_ok=True)
+    name = uuid.uuid4().hex + "_" + os.path.basename(path)
+    dest = os.path.join(files, name)
+    metadata = os.path.join(info, name + ".trashinfo")
+    with open(metadata, "x", encoding="utf-8") as f:
+        f.write("[Trash Info]\nPath=" + urllib.parse.quote(os.path.abspath(path)) +
+                "\nDeletionDate=" + datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "\n")
+    try:
+        shutil.move(path, dest)
+    except Exception:
+        if not os.path.exists(dest):
+            os.remove(metadata)
+        raise
 
 
 def unique_output(dirname, base, suffix, ext):
@@ -284,11 +346,11 @@ def encode_edge(src, start, end, info, out_dir, tmp_files, use_nvenc):
     # saída (decodifica do início e corta depois) — mais lenta, porém sempre confiável.
     fast_cmd = [FFMPEG, "-nostdin", "-y", "-ss", str(start), "-to", str(end),
                 "-i", src] + vargs + acodec + [tmp_out]
-    r = subprocess.run(fast_cmd, capture_output=True, text=True, timeout=120)
+    r = run_encode(fast_cmd, timeout=120)
     if r.returncode != 0:
         slow_cmd = [FFMPEG, "-nostdin", "-y", "-i", src, "-ss", str(start), "-to", str(end)] \
             + vargs + acodec + [tmp_out]
-        r = subprocess.run(slow_cmd, capture_output=True, text=True, timeout=600)
+        r = run_encode(slow_cmd, timeout=600)
         if r.returncode != 0:
             raise RuntimeError(f"falha ao recodificar borda: {r.stderr.strip()[-300:]}")
     tmp_files.append(tmp_out)
@@ -429,11 +491,11 @@ def encode_speed(src, start, end, speed, info, out_dir, tmp_files, use_nvenc,
 
     fast_cmd = [FFMPEG, "-nostdin", "-y", "-ss", str(start), "-to", str(end),
                 "-i", src] + vf + vargs + aargs + [tmp_out]
-    r = subprocess.run(fast_cmd, capture_output=True, text=True, timeout=600)
+    r = run_encode(fast_cmd, timeout=600)
     if r.returncode != 0:
         slow_cmd = [FFMPEG, "-nostdin", "-y", "-i", src, "-ss", str(start), "-to", str(end)] \
             + vf + vargs + aargs + [tmp_out]
-        r = subprocess.run(slow_cmd, capture_output=True, text=True, timeout=600)
+        r = run_encode(slow_cmd, timeout=600)
         if r.returncode != 0:
             raise RuntimeError(f"falha ao acelerar trecho: {r.stderr.strip()[-300:]}")
     tmp_files.append(tmp_out)
@@ -471,7 +533,7 @@ def encode_black(dur, info, src, out_dir, tmp_files, use_nvenc):
         aargs = ["-an"]
     cmd = [FFMPEG, "-nostdin", "-y"] + inputs + ["-t", f"{dur:.4f}"] \
         + vargs + ["-pix_fmt", "yuv420p"] + aargs + [tmp_out]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    r = run_encode(cmd, timeout=300)
     if r.returncode != 0:
         raise RuntimeError(f"falha ao gerar lacuna preta: {r.stderr.strip()[-300:]}")
     tmp_files.append(tmp_out)
@@ -511,35 +573,45 @@ def build_segment(src, start, end, info, keyframes, out_dir, tmp_files, use_nven
             f"inpoint {kf}\n", f"outpoint {end}\n"]
 
 
-def run_job(job_id, cmd, total_duration, output, cleanup=None):
+def run_job(job_id, cmd, total_duration, output, cleanup=None, cleanup_success=None):
     """Executa ffmpeg lendo -progress de stdout e atualiza jobs[job_id]."""
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
-        with jobs_lock:
-            procs[job_id] = proc
-        stderr_tail = []
+        fallback = cpu_fallback_cmd(cmd)
+        for attempt in (cmd, fallback):
+            if attempt is None:
+                break
+            with jobs_lock:
+                if jobs[job_id].get("cancelled"):
+                    break
+                jobs[job_id]["progress"] = 0
+            proc = subprocess.Popen(attempt, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            with jobs_lock:
+                procs[job_id] = proc
+            stderr_tail = []
 
-        def read_err():
-            for line in proc.stderr:
-                stderr_tail.append(line)
-                if len(stderr_tail) > 30:
-                    stderr_tail.pop(0)
-        t = threading.Thread(target=read_err, daemon=True)
-        t.start()
+            def read_err():
+                for line in proc.stderr:
+                    stderr_tail.append(line)
+                    if len(stderr_tail) > 30:
+                        stderr_tail.pop(0)
+            t = threading.Thread(target=read_err, daemon=True)
+            t.start()
 
-        for line in proc.stdout:
-            line = line.strip()
-            if line.startswith("out_time_ms=") and total_duration > 0:
-                try:
-                    ms = int(line.split("=")[1])
-                    pct = min(99, ms / 1_000_000 / total_duration * 100)
-                    with jobs_lock:
-                        jobs[job_id]["progress"] = round(pct, 1)
-                except ValueError:
-                    pass
-        proc.wait()
-        t.join(timeout=5)
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith("out_time_ms=") and total_duration > 0:
+                    try:
+                        ms = int(line.split("=")[1])
+                        pct = min(99, ms / 1_000_000 / total_duration * 100)
+                        with jobs_lock:
+                            jobs[job_id]["progress"] = round(pct, 1)
+                    except ValueError:
+                        pass
+            proc.wait()
+            t.join(timeout=5)
+            if proc.returncode == 0:
+                break
         with jobs_lock:
             if jobs[job_id].get("cancelled"):
                 jobs[job_id].update(status="cancelled")
@@ -558,23 +630,84 @@ def run_job(job_id, cmd, total_duration, output, cleanup=None):
     finally:
         with jobs_lock:
             procs.pop(job_id, None)
+            succeeded = jobs[job_id]['status'] == 'done'
         paths = cleanup if isinstance(cleanup, list) else ([cleanup] if cleanup else [])
+        if succeeded:
+            paths = paths + (cleanup_success or [])
         for c in paths:
             if c and os.path.exists(c):
                 os.remove(c)
 
 
-def start_job(op, cmd, duration, output, cleanup=None):
+def start_job(op, cmd, duration, output, cleanup=None, cleanup_success=None):
     job_id = uuid.uuid4().hex[:12]
     with jobs_lock:
         jobs[job_id] = {"status": "running", "progress": 0, "op": op,
                         "output": output, "error": None}
-    threading.Thread(target=run_job, args=(job_id, cmd, duration, output, cleanup),
+    threading.Thread(target=run_job, args=(job_id, cmd, duration, output, cleanup, cleanup_success),
                      daemon=True).start()
     return job_id
 
 
 # ---------- operações ----------
+
+def finish_recording():
+    # O botão flutuante e o navegador podem pedir a parada ao mesmo tempo.
+    with record_stop_lock:
+        with record_lock:
+            if record_state.get('job'):
+                return {'ok': True, 'job': record_state['job'], 'file': record_state['output']}
+            file_path = record_state['file']
+            rec_proc = record_state.get('proc')
+            overlay_proc = record_state.get('overlay')
+            moving = record_state.get('moving', False)
+        if overlay_proc:
+            try:
+                overlay_proc.terminate()
+            except (ProcessLookupError, OSError):
+                pass
+        if rec_proc:
+            try:
+                rec_proc.send_signal(signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+            rec_proc.wait(timeout=15)
+        with record_lock:
+            record_state.update(active=False, proc=None, overlay=None)
+        if moving:
+            positions = file_path + '.positions.json'
+            commands_path = None
+            try:
+                with open(positions) as f:
+                    metadata = json.load(f)
+                if not metadata.get('complete'):
+                    raise ValueError('registro de posições não foi finalizado')
+                info = probe(file_path)
+                fd, commands_path = tempfile.mkstemp(prefix='bencut-crop-', suffix='.txt')
+                os.close(fd)
+                vf = crop_filter(metadata, info['video']['width'], info['video']['height'], commands_path)
+            except Exception as e:
+                if commands_path and os.path.exists(commands_path):
+                    os.remove(commands_path)
+                raise RuntimeError(f'Não foi possível preparar o recorte: {e}. Captura completa preservada em {file_path}') from e
+            output = record_state['output']
+            cmd = [FFMPEG, '-y', '-i', file_path, '-map', '0:v:0', '-map', '0:a?',
+                   '-vf', vf, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+                   '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-af', 'asetpts=PTS-STARTPTS',
+                   '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', output]
+            job = start_job('record_crop', cmd, info['duration'], output,
+                            cleanup=[commands_path],
+                            cleanup_success=[file_path, positions])
+            with record_lock:
+                record_state['job'] = job
+            return {'ok': True, 'job': job, 'file': output}
+        if file_path and os.path.exists(file_path):
+            fixed = file_path + '.tmp.webm'
+            result = subprocess.run([FFMPEG, '-y', '-i', file_path, '-c', 'copy', fixed],
+                                    capture_output=True, env=os.environ)
+            if result.returncode == 0 and os.path.getsize(fixed) > 0:
+                os.replace(fixed, file_path)
+        return {'ok': True, 'file': file_path}
 
 def op_cut(p):
     src = safe_path(p["input"])
@@ -658,6 +791,52 @@ def op_extract_audio(p):
     cmd = [FFMPEG, "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
            "-i", src, "-vn"] + acodec + [out]
     return start_job("extract", cmd, info["duration"], out)
+
+
+def op_export_audio(p):
+    """Mixa a timeline diretamente em áudio, sem criar vídeo temporário."""
+    fmt = p.get('format')
+    if fmt not in ('mp3', 'wav'):
+        raise ValueError('Escolha MP3 ou WAV para exportar somente áudio')
+    out = safe_path(p['output'])
+    if os.path.splitext(out)[1].lower() != '.' + fmt:
+        raise ValueError(f'O nome do arquivo deve terminar em .{fmt}')
+    duration = float(p.get('duration') or 0)
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError('Duração inválida')
+    tracks, infos = [], {}
+    for row in p.get('tracks', []):
+        src = safe_path(row[0])
+        if os.path.realpath(src) == os.path.realpath(out):
+            raise ValueError('Escolha um nome diferente do arquivo de origem')
+        start, end, at, volume, speed = map(float, row[1:6])
+        if (not all(math.isfinite(n) for n in (start, end, at, volume, speed))
+                or start < 0 or end <= start or at < 0 or volume < 0 or speed <= 0):
+            raise ValueError('Corte, posição, volume ou velocidade inválidos')
+        length = (end - start) / speed
+        duration = max(duration, at + length)
+        if src not in infos:
+            infos[src] = probe(src)
+        if infos[src]['audio']:
+            tracks.append((src, start, end, at, volume, speed, length))
+    if not tracks:
+        raise ValueError('A timeline não contém nenhuma faixa de áudio para exportar')
+    cmd = [FFMPEG, '-nostdin', '-y', '-progress', 'pipe:1', '-nostats',
+           '-f', 'lavfi', '-t', str(duration), '-i', 'anullsrc=r=48000:cl=stereo']
+    filters, labels = [], ['[0:a]']
+    for i, (src, start, end, at, volume, speed, length) in enumerate(tracks, 1):
+        cmd += ['-ss', str(start), '-t', str(end - start), '-i', src]
+        filters.append(f'[{i}:a:0]asetpts=PTS-STARTPTS,{atempo_chain(speed)},'
+                       f'aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,'
+                       f'volume={volume},apad,atrim=duration={length},'
+                       f'adelay={round(at * 48000)}S:all=1[a{i}]')
+        labels.append(f'[a{i}]')
+    filters.append(f'{"".join(labels)}amix=inputs={len(labels)}:duration=first:'
+                   'normalize=0:dropout_transition=0[aout]')
+    encoder = ['-c:a', 'libmp3lame', '-q:a', '2'] if fmt == 'mp3' else ['-c:a', 'pcm_s16le']
+    cmd += ['-filter_complex', ';'.join(filters), '-map', '[aout]', '-vn',
+            '-t', str(duration)] + encoder + [out]
+    return start_job('export_audio', cmd, duration, out)
 
 
 def op_delete(p):
@@ -1151,6 +1330,7 @@ def op_overlay_vclips(p):
 
 
 OPS = {"cut": op_cut, "join": op_join, "convert": op_convert,
+       "export_audio": op_export_audio,
        "extract": op_extract_audio, "delete": op_delete, "render": op_render,
        "render_convert": op_render_convert, "render_multi": op_render_multi,
        "mix_audio": op_mix_audio, "overlay_images": op_overlay_images,
@@ -1247,7 +1427,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/api/config":
             return self._json({"nvenc": NVENC, "startDir": START_DIR,
-                               "ffmpeg": FFMPEG})
+                               "ffmpeg": FFMPEG, "movingRecording": True, "recordCropSize": True, "cursorLayer": True})
 
         if route == "/api/record/status":
             with record_lock:
@@ -1264,7 +1444,9 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/list":
             try:
                 d = safe_path(q.get("dir", [START_DIR])[0])
-                entries = {"dir": d, "parent": os.path.dirname(d),
+                # Na raiz de vídeos externa, Voltar retorna ao home, não a /mnt.
+                parent = HOME if d in ALLOWED_ROOTS else os.path.dirname(d)
+                entries = {"dir": d, "parent": parent,
                            "dirs": [], "files": []}
                 for name in sorted(os.listdir(d), key=str.lower):
                     if name.startswith("."):
@@ -1428,6 +1610,42 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "rota desconhecida"}, 404)
 
     def do_POST(self):
+        if urllib.parse.urlparse(self.path).path == "/api/import":
+            temp_path = None
+            try:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                name = q.get("name", [""])[0]
+                if not name or name.startswith(".") or "/" in name or "\\" in name:
+                    raise ValueError("nome de arquivo inválido")
+                ext = os.path.splitext(name)[1].lower()
+                if ext not in VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS:
+                    raise ValueError("selecione um arquivo de vídeo, áudio ou imagem")
+                length = int(self.headers.get("Content-Length", 0))
+                if length <= 0:
+                    raise ValueError("arquivo vazio")
+                directory = safe_path(os.path.join(START_DIR, "BenCut importados"))
+                os.makedirs(directory, exist_ok=True)
+                # Recebe em blocos para não manter vídeos grandes na memória.
+                with tempfile.NamedTemporaryFile(prefix=".import-", dir=directory,
+                                                 delete=False) as f:
+                    temp_path = f.name
+                    remaining = length
+                    while remaining:
+                        chunk = self.rfile.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise ValueError("transferência interrompida")
+                        f.write(chunk)
+                        remaining -= len(chunk)
+                output = os.path.join(directory, uuid.uuid4().hex[:12] + "_" + name)
+                os.rename(temp_path, output)
+                temp_path = None
+                kind = "video" if ext in VIDEO_EXTS else "audio" if ext in AUDIO_EXTS else "image"
+                return self._json({"path": output, "dir": directory, "kind": kind})
+            except Exception as e:
+                return self._json({"error": str(e)}, 400)
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
@@ -1507,8 +1725,25 @@ class Handler(BaseHTTPRequestHandler):
                 with record_lock:
                     if record_state['active']:
                         return self._json({"error": "já está gravando"}, 400)
+                    job = record_state.get('job')
+                    if job and jobs.get(job, {}).get('status') == 'running':
+                        return self._json({"error": "Aguarde o processamento da gravação"}, 400)
                 aspect = body.get("aspect") or None
                 fullscreen = bool(body.get("fullscreen", False))
+                cursor_layer = bool(body.get('cursorLayer', False))
+                moving = bool(body.get('movePositions', False)) or cursor_layer
+                crop_size = body.get('cropSize') or ''
+                if crop_size and (crop_size != '540x960' or aspect != '9:16' or fullscreen):
+                    raise ValueError('O recorte 540 × 960 está disponível somente em 9:16')
+                if moving:
+                    if aspect != '9:16' or fullscreen:
+                        raise ValueError('Alterar posição com Tab está disponível somente em 9:16')
+                    check = subprocess.run(['python3', os.path.join(ROOT, 'screen_recorder.py'),
+                                            'check-moving'] + (['--cursor-layer'] if cursor_layer else []), capture_output=True, text=True, timeout=10)
+                    if check.returncode:
+                        if cursor_layer:
+                            raise RuntimeError('Ative a extensão atualizada do BenCut. Se ela já estiver instalada, saia e entre na conta do Ubuntu para carregar a camada do cursor.')
+                        raise RuntimeError('Ative a extensão “BenCut — posição da gravação” no GNOME para usar Tab.')
                 vid_dir = os.path.join(HOME, "Vídeos")
                 os.makedirs(vid_dir, exist_ok=True)
                 ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1518,10 +1753,14 @@ class Handler(BaseHTTPRequestHandler):
                 if os.path.exists(REC_OUT):
                     os.remove(REC_OUT)
                 area_arg = "fullscreen"
-                if not fullscreen:
+                if cursor_layer:
+                    area_arg = '0,0,540,960'
+                elif not fullscreen:
                     sel_cmd = ["python3", os.path.join(ROOT, "screen_select.py")]
                     if aspect:
                         sel_cmd.append(aspect)
+                    if crop_size:
+                        sel_cmd.append(crop_size)
                     sel = subprocess.run(
                         sel_cmd, capture_output=True, text=True,
                         timeout=120, env=os.environ)
@@ -1539,7 +1778,7 @@ class Handler(BaseHTTPRequestHandler):
                 ERR_FILE = "/tmp/bencut_rec_err.txt"
                 rec_proc = subprocess.Popen(
                     ["python3", os.path.join(ROOT, "screen_recorder.py"),
-                     "start", template, area_arg],
+                     "start", template, area_arg] + (['--moving'] if moving else []) + (['--cursor-layer'] if cursor_layer else []),
                     env=os.environ,
                     stderr=open(ERR_FILE, "w"))
                 # aguarda o script confirmar início (cria o arquivo de saída)
@@ -1570,6 +1809,9 @@ class Handler(BaseHTTPRequestHandler):
                     record_state['file'] = actual_file
                     record_state['proc'] = rec_proc
                     record_state['overlay'] = overlay_proc
+                    record_state['moving'] = moving
+                    record_state['output'] = template + '.mp4' if moving else actual_file
+                    record_state['job'] = None
                 return self._json({"ok": True, "file": actual_file})
             except subprocess.TimeoutExpired:
                 return self._json({"error": "Tempo esgotado na seleção"}, 400)
@@ -1578,38 +1820,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/api/record/stop":
             try:
-                with record_lock:
-                    file_path = record_state['file']
-                    rec_proc = record_state.get('proc')
-                    overlay_proc = record_state.get('overlay')
-                if overlay_proc:
-                    try:
-                        overlay_proc.terminate()
-                    except (ProcessLookupError, OSError):
-                        pass
-                if rec_proc:
-                    try:
-                        rec_proc.send_signal(signal.SIGTERM)
-                    except (ProcessLookupError, OSError):
-                        pass  # processo já encerrou (parada externa)
-                    try:
-                        rec_proc.wait(timeout=8)
-                    except subprocess.TimeoutExpired:
-                        rec_proc.terminate()
-                with record_lock:
-                    record_state['active'] = False
-                    record_state['proc'] = None
-                    record_state['overlay'] = None
-                # aguarda o GStreamer fechar o arquivo antes de remuxar
-                import time; time.sleep(1.0)
-                if file_path and os.path.exists(file_path):
-                    fixed = file_path + ".tmp.webm"
-                    subprocess.run([FFMPEG, "-y", "-i", file_path,
-                                    "-c", "copy", fixed],
-                                   capture_output=True, env=os.environ)
-                    if os.path.exists(fixed) and os.path.getsize(fixed) > 0:
-                        os.replace(fixed, file_path)
-                return self._json({"ok": True, "file": file_path})
+                return self._json(finish_recording())
             except Exception as e:
                 return self._json({"error": str(e)}, 400)
 

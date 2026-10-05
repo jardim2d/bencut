@@ -4,6 +4,8 @@ Clique em qualquer lugar para parar. Arraste para reposicionar.
 Uso: rec_overlay.py [PORT]
 """
 import os
+from desktop_session import refresh_display_environment
+refresh_display_environment()
 os.environ.setdefault('GDK_BACKEND', 'x11')
 
 import json

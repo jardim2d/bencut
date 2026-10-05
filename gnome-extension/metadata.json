@@ -1,0 +1,7 @@
+{
+  "uuid": "bencut-recorder@local",
+  "name": "BenCut — posição da gravação",
+  "description": "Recorte com Tab ou base central fixa com camada inferior acompanhando o cursor, somente durante a gravação.",
+  "shell-version": ["50"],
+  "version": 2
+}

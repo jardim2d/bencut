@@ -147,6 +147,14 @@ const dirByKind = (() => {
   catch { return base; }
 })();
 
+// Remover da biblioteca oculta o item neste navegador, sem alterar o arquivo.
+const hiddenFiles = (() => {
+  try {
+    const paths = JSON.parse(localStorage.getItem("bencutHiddenFiles") || "[]");
+    return new Set(Array.isArray(paths) ? paths : []);
+  } catch { return new Set(); }
+})();
+
 // clicar num arquivo o SELECIONA (destaque persistente na lista), sem enviá-lo
 // à timeline — carregar continua sendo só pelo arraste.
 function selectFile(path) {
@@ -183,20 +191,6 @@ async function browse(dir) {
   const ul = $("browser-list");
   ul.innerHTML = "";
 
-  const li = document.createElement("li");
-  li.className = "dir up";
-  li.title = "Voltar para a pasta anterior";
-  li.innerHTML = `<img src="/icons/back.svg" alt="Voltar">`;
-  li.onclick = () => browse(data.parent);
-  ul.appendChild(li);
-
-  for (const d of data.dirs) {
-    const li = document.createElement("li");
-    li.className = "dir";
-    li.innerHTML = `<span class="name">${d}/</span>`;
-    li.onclick = () => browse(data.dir + "/" + d);
-    ul.appendChild(li);
-  }
   renderGrid();
 }
 
@@ -213,6 +207,7 @@ function renderGrid() {
     : f.kind === "video" || f.kind === "project");
   for (const f of files) {
     const full = data.dir + "/" + f.name;
+    if (hiddenFiles.has(full)) continue;
     const isProject = f.kind === "project";
     const isAudio = f.kind === "audio";
     const isImage = f.kind === "image";
@@ -283,6 +278,53 @@ for (const b of document.querySelectorAll(".mf-btn")) {
 }
 
 // ---------- menu de contexto (botão direito nos cards) ----------
+// Arquivos externos não expõem seu caminho local ao navegador. Importa uma
+// cópia pelo servidor e usa o caminho retornado nos projetos e na timeline.
+let importChain = Promise.resolve();
+function importFiles(files) {
+  const batch = Array.from(files);
+  importChain = importChain.then(async () => {
+    const btn = $("btn-import");
+    btn.disabled = true;
+    btn.textContent = "Importando…";
+    const errors = [];
+    try {
+      for (const file of batch) {
+        try {
+          $("file-info").textContent = "Importando " + file.name + "…";
+          const r = await api("/api/import?name=" + encodeURIComponent(file.name), {
+            method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: file,
+          });
+          if (r.kind === "audio") await addAudioClip(r.path, timelineDur());
+          else if (r.kind === "image") await addImageClip(r.path, timelineDur());
+          else await addToTimeline(r.path);
+          await browse(r.dir);
+        } catch (e) { errors.push(file.name + ": " + e.message); }
+      }
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Importar";
+      $("import-files").value = "";
+    }
+    if (errors.length) alert("Não foi possível importar:\n" + errors.join("\n"));
+  });
+  return importChain;
+}
+$("btn-import").onclick = () => $("import-files").click();
+$("import-files").onchange = (e) => importFiles(e.target.files);
+document.addEventListener("dragover", (e) => {
+  if (!Array.from(e.dataTransfer.types).includes("Files")) return;
+  e.preventDefault();
+  e.stopPropagation();
+  e.dataTransfer.dropEffect = "copy";
+}, true);
+document.addEventListener("drop", (e) => {
+  if (!e.dataTransfer.files.length) return;
+  e.preventDefault();
+  e.stopPropagation();
+  importFiles(e.dataTransfer.files);
+}, true);
+
 let ctxMenu = null;
 function closeCtxMenu() { if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; } }
 document.addEventListener("click", closeCtxMenu);
@@ -304,7 +346,7 @@ function showFileMenu(e, path, name) {
   };
   item("Renomear", "", () => renameFile(path, name));
   item("Mover…", "", () => moveFile(path, name));
-  item("Deletar", "danger", () => deleteFile(path, name));
+  item("Remover da lista", "", () => removeFromLibrary(path));
   document.body.appendChild(menu);
   // posiciona no cursor sem transbordar a janela
   const r = menu.getBoundingClientRect();
@@ -313,7 +355,7 @@ function showFileMenu(e, path, name) {
   ctxMenu = menu;
 }
 
-// renomear/deletar quebrariam a edição se o arquivo estiver na timeline
+// renomear/mover quebrariam a edição se o arquivo estiver na timeline
 const fileInTimeline = (path) =>
   state.segments.some(s => !s.deleted && s.src === path) ||
   state.audioTrack.some(c => c.src === path) ||
@@ -372,18 +414,13 @@ async function moveFile(path, name) {
   } catch (e) { alert("Erro ao mover: " + e.message); }
 }
 
-async function deleteFile(path, name) {
-  if (fileInTimeline(path))
-    return alert("Este arquivo está na timeline. Remova-o da edição antes de deletar.");
-  if (!confirm(`Mover para a lixeira?\n\n${name}`)) return;
+function removeFromLibrary(path) {
   try {
-    await api("/api/file-delete", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-    });
-    forgetFile(path, null);
-    await browse(browseDir);
-  } catch (e) { alert("Erro ao deletar: " + e.message); }
+    localStorage.setItem("bencutHiddenFiles", JSON.stringify([...hiddenFiles, path]));
+    hiddenFiles.add(path);
+    if (selectedFile === path) selectedFile = null;
+    renderGrid();
+  } catch (e) { alert("Erro ao remover da lista: " + e.message); }
 }
 
 // ---------- painel lateral redimensionável ----------
@@ -2456,7 +2493,7 @@ canvas.addEventListener("pointermove", (e) => {
         state.videoTrack.push({
           src: seg.src, start: seg.start, end: seg.end,
           at: segAt, track: vc.track || 0, speed: seg.speed || 1, hue: seg.hue,
-          x: 0, y: 0, scale: 1, volume: 1, opacity: 1
+          x: 0, y: 0, scale: 1, volume: seg.volume ?? 1, opacity: seg.opacity ?? 1
         });
         state.segments.splice(segIdx, 0, {
           src: vc.src, start: vc.start, end: vc.end,
@@ -2610,7 +2647,7 @@ canvas.addEventListener("pointermove", (e) => {
       state.videoTrack.push({
         src: seg.src, start: seg.start, end: seg.end,
         at, track: 0, speed: seg.speed || 1, hue: seg.hue,
-        x: 0, y: 0, scale: 1, volume: 1, opacity: 1
+        x: 0, y: 0, scale: 1, volume: seg.volume ?? 1, opacity: seg.opacity ?? 1
       });
       const newIdx = state.videoTrack.length - 1;
       const frozenH = trackHeightCss();
@@ -3325,12 +3362,13 @@ function setExportOptsVisible(show) {
 }
 $("btn-export").onclick = () => {
   setExportOptsVisible(true);
-  $("export-format").value = getOriginalFormat() ? "" : "mp4";
+  const audioOnly = !keptSegs().length && !state.videoTrack.length && !state.imageTrack.length && state.audioTrack.length;
+  $("export-format").value = audioOnly ? "mp3" : getOriginalFormat() ? "" : "mp4";
 };
 // salvar PROJETO (.evp): grava os segmentos da timeline em JSON para retomar depois
 $("btn-save").onclick = async () => {
   if (!hasContent()) return;
-  const refSrc = (state.segments[0] || state.audioTrack[0] || state.imageTrack[0]).src;
+  const refSrc = (state.segments[0] || state.audioTrack[0] || state.imageTrack[0] || state.videoTrack[0]).src;
   try {
     const picked = await api("/api/pick-save?input=" + encodeURIComponent(refSrc) +
       "&suffix=projeto&ext=evp&title=" + encodeURIComponent("Salvar projeto"));
@@ -3456,6 +3494,31 @@ $("btn-export-go").onclick = async () => {
   const vclips = state.videoTrack;
   const images = state.imageTrack.map(c => [c.src, c.at, c.duration, c.opacity ?? 1, c.x ?? 0, c.y ?? 0, c.scale ?? 1, c.rotation ?? 0]);
   const audios = state.audioTrack.map(c => [c.src, c.start, c.end, c.at, c.volume ?? 1, c.speed ?? 1]);
+  const audioFormat = $("export-format").value;
+  if (["mp3", "wav"].includes(audioFormat)) {
+    const tracks = [...audios];
+    let at = 0;
+    for (const s of kept) {
+      at += s.gap || 0;
+      tracks.push([s.src, s.start, s.end, at, s.volume ?? 1, s.speed || 1]);
+      at += segVis(s);
+    }
+    for (const c of vclips)
+      tracks.push([c.src, c.start, c.end, c.at, c.volume ?? 1, c.speed || 1]);
+    if (!tracks.length) { alert('Adicione áudio ou um vídeo com áudio à timeline.'); return; }
+    const btn = $("btn-export-go");
+    btn.disabled = true;
+    try {
+      const picked = await api('/api/pick-save?input=' + encodeURIComponent(tracks[0][0]) +
+        '&suffix=audio_editado&ext=' + audioFormat + '&title=' + encodeURIComponent('Exportar somente áudio'));
+      if (picked.cancelled) return;
+      const job = await submitJob({op: 'export_audio', output: picked.path, format: audioFormat,
+        duration: timelineDur(), tracks});
+      if (job) setExportOptsVisible(false);
+    } catch (e) { alert('Erro na exportação de áudio: ' + e.message); }
+    finally { btn.disabled = false; }
+    return;
+  }
   // projeto SEM vídeo: base preta com as imagens gravadas e/ou mix das trilhas
   if (!kept.length && !vclips.length) {
     if (!audios.length && !images.length) return;
@@ -3733,7 +3796,8 @@ function renderState() {
     || state.videoTrack.length > 0);
   const audioOnlyExportable = kept === 0 && (state.audioTrack.length > 0 || state.imageTrack.length > 0);
   const vclipExportable = kept === 0 && state.videoTrack.length > 0;
-  $("btn-export").disabled = !(videoExportable || audioOnlyExportable || vclipExportable);
+  const audioExportable = keptSegs().some(s => sources.get(s.src)?.info?.audio);
+  $("btn-export").disabled = !(videoExportable || audioOnlyExportable || vclipExportable || audioExportable);
   $("btn-save").disabled = !hasContent();   // salvar projeto: basta ter timeline
   $("mark-info").textContent = (nFiles > 1 ? `${nFiles} arquivos · ` : "")
     + (segs.length > 1
@@ -3774,7 +3838,7 @@ function startPolling() {
 
 const OP_LABEL = {
   cut: "Corte", join: "Junção", convert: "Conversão",
-  extract: "Áudio", delete: "Remoção", render: "Exportação", render_convert: "Exportação",
+  extract: "Áudio", export_audio: "Exportação de áudio", delete: "Remoção", render: "Exportação", render_convert: "Exportação",
   render_multi: "Exportação", mix_audio: "Exportação", overlay_images: "Exportação",
   preview: "Pré-visualização",
 };
@@ -3835,20 +3899,23 @@ $("btn-add-lane").onclick = () => {
 $("btn-extract").onclick = () => submitJob({ op: "extract", input: activeSrc });
 
 // ---------- gravação de tela ----------
-let recPhase = 'idle'; // 'idle' | 'selecting' | 'recording'
+let recPhase = 'idle'; // 'idle' | 'selecting' | 'recording' | 'processing'
 let recFile = null;
 let recTimerInterval = null;
 let recPollInterval = null;
 let recElapsed = 0;
 
 async function stopRecordingUI() {
+  if (recPhase === 'processing') return;
+  recPhase = 'processing';
+  renderRecUI();
   if (recPollInterval) { clearInterval(recPollInterval); recPollInterval = null; }
   if (recTimerInterval) { clearInterval(recTimerInterval); recTimerInterval = null; }
   try {
     const r = await api('/api/record/stop', {
       method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
     });
-    recFile = r.file;
+    recFile = r.job ? (await pollJob(r.job)).output : r.file;
   } catch (e) {
     alert('Erro ao parar: ' + e.message);
   }
@@ -3861,6 +3928,7 @@ for (const btn of document.querySelectorAll('.rec-asp')) {
   btn.onclick = () => {
     document.querySelectorAll('.rec-asp').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
+    renderRecUI();
   };
 }
 
@@ -3868,13 +3936,22 @@ function renderRecUI() {
   const idle = recPhase === 'idle';
   const selecting = recPhase === 'selecting';
   const recording = recPhase === 'recording';
+  const processing = recPhase === 'processing';
+  const vertical = document.querySelector('.rec-asp.active')?.dataset.asp === '9:16';
+  $('rec-move-option').classList.toggle('hidden', !vertical);
+  $('rec-size-option').classList.toggle('hidden', !vertical);
+  $('rec-size').disabled = !idle || $('rec-cursor-layer').checked;
+  $('rec-cursor-layer').disabled = !idle;
+  $('rec-move').disabled = !idle;
+  $('rec-audio').disabled = !idle;
+  document.querySelectorAll('.rec-asp').forEach(b => { b.disabled = !idle; });
   const startBtn = $('btn-rec-start');
-  startBtn.disabled = selecting;
+  startBtn.disabled = selecting || processing;
   if (recording) {
     startBtn.textContent = '■  Parar Gravação';
     startBtn.className = 'rec-btn-stop';
   } else {
-    startBtn.textContent = idle ? '⬤  Iniciar Gravação' : 'Aguardando seleção...';
+    startBtn.textContent = idle ? '⬤  Iniciar Gravação' : processing ? 'Processando gravação...' : 'Aguardando seleção...';
     startBtn.className = 'rec-btn-start';
   }
   $('rec-status-row').classList.toggle('hidden', !recording);
@@ -3892,13 +3969,20 @@ $('btn-rec-start').onclick = async () => {
   const fullscreen = !!aspBtn?.dataset.full;
   const aspect = (!fullscreen && aspBtn?.dataset.asp) ? aspBtn.dataset.asp : null;
   const audio = $('rec-audio').checked;
+  const cursorLayer = aspect === '9:16' && $('rec-cursor-layer').checked;
+  const movePositions = aspect === '9:16' && $('rec-move').checked && !cursorLayer;
+  const cropSize = cursorLayer ? '540x960' : aspect === '9:16' ? $('rec-size').value : '';
   recPhase = 'selecting';
   recFile = null;
   renderRecUI();
   try {
+    const recConfig = (movePositions || cropSize) ? await api('/api/config') : {};
+    if ((movePositions && !recConfig.movingRecording) || (cropSize && !recConfig.recordCropSize) || (cursorLayer && !recConfig.cursorLayer)) {
+      throw new Error('Este servidor está desatualizado. Reinicie o BenCut para usar estas opções de gravação.');
+    }
     const r = await api('/api/record/start', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({aspect, audio, fullscreen}),
+      body: JSON.stringify({aspect, audio, fullscreen, movePositions, cropSize, cursorLayer}),
     });
     recPhase = 'recording';
     recElapsed = 0;
@@ -3928,6 +4012,17 @@ $('btn-rec-add').onclick = () => {
   if (recFile) addToTimeline(recFile);
 };
 
+$('rec-cursor-layer').onchange = () => {
+  if ($('rec-cursor-layer').checked) {
+    $('rec-move').checked = false;
+    $('rec-size').value = '540x960';
+  }
+  renderRecUI();
+};
+$('rec-move').onchange = () => {
+  if ($('rec-move').checked) $('rec-cursor-layer').checked = false;
+  renderRecUI();
+};
 renderRecUI();
 
 // ---------- init ----------
